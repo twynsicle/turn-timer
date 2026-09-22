@@ -1,6 +1,8 @@
 import { StrictMode } from "react";
 import { createRoot } from "react-dom/client";
 import { App } from "./App.js";
+import "@fontsource-variable/inter-tight";
+import "@fontsource-variable/jetbrains-mono";
 import "./styles.css";
 
 createRoot(document.getElementById("root")!).render(

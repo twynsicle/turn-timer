@@ -6,7 +6,6 @@ import {
   runTotals,
   sessionStats,
   turnModelMs,
-  turnToolMs,
 } from "../../src/core/metrics.js";
 import type { Prompt, Session, ToolCall, Turn } from "../../src/core/types.js";
 import { type DetailTarget, Histogram, Tiles, ToolsTable, fmtDate, formatMs, pct, singleClass } from "./common.js";
@@ -135,9 +134,15 @@ export function SessionView({
             <span className="r">Calls</span>
             <span className="r">Avg</span>
             <span className="r">Single</span>
-            <span className="r">Runs</span>
-            <span className="r">Saveable</span>
-            <span className="r">Model</span>
+            <span className="r" title="Batchable runs: likely / possibly">
+              Runs
+            </span>
+            <span className="r" title="Round-trip overhead batching would have saved">
+              Time saved
+            </span>
+            <span className="r" title="Total model response time for this prompt">
+              Model time
+            </span>
           </div>
           {prompts.map((p) => (
             <PromptBlock key={p.index} p={p} st={perPrompt.get(p.index)!} open={expanded.has(p.index)} onToggle={() => toggle(p.index)} ctx={ctx} />
@@ -198,20 +203,30 @@ const PromptBlock = memo(function PromptBlock({
       </button>
       {open && (
         <div className="turns">
-          <TurnList turns={p.turns} ctx={ctx} maxMs={maxTurnMs(p.turns)} />
+          <TurnList turns={p.turns} ctx={ctx} />
         </div>
       )}
     </div>
   );
 });
 
-function maxTurnMs(turns: Turn[]): number {
-  return Math.max(1, ...turns.map((t) => turnModelMs(t) + turnToolMs(t)));
-}
-
-function TurnList({ turns, ctx, maxMs }: { turns: Turn[]; ctx: Ctx; maxMs: number }) {
+function TurnList({ turns, ctx }: { turns: Turn[]; ctx: Ctx }) {
   return (
     <ol className="turn-list">
+      <li className="turn turn-header" aria-hidden>
+        <span className="r">Turn</span>
+        <span className="r">Calls</span>
+        <span className="step-cols">
+          <span>Tool</span>
+          <span>Input</span>
+          <span className="r" title="How long the tool took to run">
+            Tool time
+          </span>
+        </span>
+        <span className="r" title="How long the model took to produce this turn, from the previous result arriving to the response finishing">
+          Model time
+        </span>
+      </li>
       {turns.map((t, i) => {
         const run = ctx.runOf.get(t.messageId);
         const runStart = run && run.turnIds[0] === t.messageId;
@@ -224,7 +239,7 @@ function TurnList({ turns, ctx, maxMs }: { turns: Turn[]; ctx: Ctx; maxMs: numbe
                 <span className="muted"> · saves {run.savedTurns} round-trip{run.savedTurns === 1 ? "" : "s"}, ~{formatMs(run.savedMs)}</span>
               </div>
             )}
-            <TurnRow t={t} index={i + 1} ctx={ctx} maxMs={maxMs} />
+            <TurnRow t={t} index={i + 1} ctx={ctx} />
             {ctx.subagents &&
               t.toolCalls
                 .filter((c) => c.subagent)
@@ -236,42 +251,42 @@ function TurnList({ turns, ctx, maxMs }: { turns: Turn[]; ctx: Ctx; maxMs: numbe
   );
 }
 
-function TurnRow({ t, index, ctx, maxMs }: { t: Turn; index: number; ctx: Ctx; maxMs: number }) {
+function TurnRow({ t, index, ctx }: { t: Turn; index: number; ctx: Ctx }) {
   const ref = useRef<HTMLDivElement>(null);
   const focused = ctx.focusTurn === t.messageId;
   useEffect(() => {
     if (focused) ref.current?.scrollIntoView({ block: "center", behavior: "smooth" });
   }, [focused]);
   const n = t.toolCalls.length;
-  const model = turnModelMs(t);
-  const tools = turnToolMs(t);
   return (
     <div ref={ref} className={`turn ${focused ? "focused" : ""}`}>
-      <span className="turn-idx num muted">{index}</span>
-      <span className={`badge ${n === 0 ? "zero" : n === 1 ? "one" : n <= 3 ? "few" : "many"}`} title={`${n} tool call${n === 1 ? "" : "s"} in this turn`}>
-        {n || "·"}
-      </span>
-      <div className="chips">
-        {n === 0 && <span className="muted small">{t.hasText ? "text response" : "thinking only"}</span>}
-        {t.toolCalls.map((c) => (
-          <button
-            key={c.id}
-            className={`chip cat-${c.category} ${c.isError ? "err" : ""} ${c.denied ? "denied" : ""} ${ctx.selectedCall === c.id ? "selected" : ""}`}
-            title={`${c.name}: ${c.summary}`}
-            onClick={() => ctx.onOpen({ call: c, turn: t, project: ctx.project, session: ctx.sessionId })}
-          >
-            <span className="chip-name">{shortName(c.name)}</span>
-            {c.summary && <span className="chip-sum">{shortSummary(c)}</span>}
-          </button>
-        ))}
-      </div>
-      <div className="timing" title={`model ${formatMs(model)} · tools ${formatMs(tools)}`}>
-        <span className="time-track">
-          <span className="time-model" style={{ width: `${(model / maxMs) * 100}%` }} />
-          <span className="time-tool" style={{ width: `${(tools / maxMs) * 100}%` }} />
+      <span className="turn-idx num">{index}</span>
+      <span>
+        <span className={`badge ${n === 0 ? "zero" : n === 1 ? "one" : n <= 3 ? "few" : "many"}`} title={`${n} tool call${n === 1 ? "" : "s"} in this turn`}>
+          {n || "–"}
         </span>
-        <span className="num small muted">{formatMs(model + tools)}</span>
-      </div>
+      </span>
+      <ul className="steps">
+        {n === 0 && <li className="step-none">{t.hasText ? "Text response, no tools" : "Thinking only, no tools"}</li>}
+        {t.toolCalls.map((c) => (
+          <li key={c.id}>
+            <button
+              className={`step cat-${c.category} ${ctx.selectedCall === c.id ? "selected" : ""}`}
+              title={`${c.name}: ${c.summary}`}
+              onClick={() => ctx.onOpen({ call: c, turn: t, project: ctx.project, session: ctx.sessionId })}
+            >
+              <span className={`step-name ${c.denied ? "denied" : ""}`}>{shortName(c.name)}</span>
+              <span className="step-sum">
+                {c.isError && <span className="pill bad">error</span>}
+                {c.denied && <span className="pill bad">denied</span>}
+                {c.summary || <span className="muted">(no input)</span>}
+              </span>
+              <span className="step-time num">{c.finishedAt ? formatMs(c.finishedAt - c.startedAt) : "–"}</span>
+            </button>
+          </li>
+        ))}
+      </ul>
+      <span className="turn-model num">{formatMs(turnModelMs(t))}</span>
     </div>
   );
 }
@@ -299,7 +314,7 @@ function SubagentBlock({ call, ctx }: { call: ToolCall; ctx: Ctx }) {
           {st.runs.length > 0 && <> · <span className="bad">{st.runs.length} runs</span></>}
         </span>
       </button>
-      {open && <TurnList turns={run.turns} ctx={ctx} maxMs={maxTurnMs(run.turns)} />}
+      {open && <TurnList turns={run.turns} ctx={ctx} />}
     </div>
   );
 }
@@ -372,13 +387,4 @@ function shortName(name: string): string {
   // mcp__server__tool → server·tool
   const m = /^mcp__(.+?)__(.+)$/.exec(name);
   return m ? `${m[1]!.replace(/^plugin_[^_]+_/, "")}·${m[2]}` : name;
-}
-
-function shortSummary(c: ToolCall): string {
-  let s = c.summary;
-  if (c.paths.length && (c.category === "read" || c.category === "edit")) {
-    // Show just the file name for path-based tools; the drawer has the full path.
-    s = s.replace(/[A-Za-z]:[\\/][^\s]*|\/[^\s]+/g, (p) => p.split(/[\\/]/).pop() ?? p);
-  }
-  return s.length > 48 ? s.slice(0, 47) + "…" : s;
 }
