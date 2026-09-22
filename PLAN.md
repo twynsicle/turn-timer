@@ -116,6 +116,8 @@ Parallel tool calls split across lines · user interrupts (`[Request interrupted
 
 ## Milestones
 
+Status (2026-09-21): 1–4 done. Remaining: test on macOS, packaging polish.
+
 1. **Core:** paths, discover, stream parse and model, with vitest tests on the fixtures. Check against the prototype numbers (Alien Loot main thread: about 53% single-call turns).
 2. **CLI:** `projects`, `sessions`, `show`, and the interactive picker.
 3. **Metrics:** batchable-run detection, `stats` across a project, and the summary cache.

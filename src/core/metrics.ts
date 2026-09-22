@@ -27,7 +27,7 @@ export interface BatchableRun {
   tools: string[];
   /** Round-trips that batching would have saved (run length - 1). */
   savedTurns: number;
-  /** Model latency of the turns after the first — the time batching would have saved. */
+  /** Round-trip overhead of the turns after the first — the time batching would have saved. */
   savedMs: number;
 }
 
@@ -58,6 +58,20 @@ export interface Stats {
 }
 
 export const turnModelMs = (t: Turn) => Math.max(0, t.respondedAt - t.requestedAt);
+
+/**
+ * Output generation speed used to split a turn's latency into generation time and fixed
+ * round-trip overhead. Calibrated from real Opus sessions (median ~12.6ms per output
+ * token, thinking included); rounded up so savings estimates stay conservative.
+ */
+export const MS_PER_OUTPUT_TOKEN = 13;
+
+/**
+ * Latency a turn spent on things other than generating output: request overhead, prompt
+ * processing, time to first token. This is what batching saves — a batched turn still has
+ * to generate the same thinking and tool inputs.
+ */
+export const turnOverheadMs = (t: Turn) => Math.max(0, turnModelMs(t) - t.outputTokens * MS_PER_OUTPUT_TOKEN);
 
 export function turnToolMs(t: Turn): number {
   let start = Infinity;
@@ -116,7 +130,7 @@ export function findRuns(turns: Turn[], promptIndex: number): BatchableRun[] {
         turnIds: run.map((t) => t.messageId),
         tools: calls.map((c) => c.name),
         savedTurns: run.length - 1,
-        savedMs: run.slice(1).reduce((s, t) => s + turnModelMs(t), 0),
+        savedMs: run.slice(1).reduce((s, t) => s + turnOverheadMs(t), 0),
       });
     }
     run = [];
@@ -270,4 +284,17 @@ export function formatMs(ms: number): string {
 
 export function pct(n: number, d: number): string {
   return d ? `${Math.round((n / d) * 100)}%` : "–";
+}
+
+export interface RunTotals {
+  likely: { runs: number; turns: number; ms: number };
+  possibly: { runs: number; turns: number; ms: number };
+}
+
+export function runTotals(runs: BatchableRun[]): RunTotals {
+  const t = (k: RunKind) => {
+    const rs = runs.filter((r) => r.kind === k);
+    return { runs: rs.length, turns: rs.reduce((s, r) => s + r.savedTurns, 0), ms: rs.reduce((s, r) => s + r.savedMs, 0) };
+  };
+  return { likely: t("likely"), possibly: t("possibly") };
 }

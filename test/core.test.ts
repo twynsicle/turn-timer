@@ -187,3 +187,12 @@ describe("discover", () => {
     expect(sessions[0]!.path).toBe(join(root, "C--proj", "sess.jsonl"));
   });
 });
+
+describe("turnOverheadMs", () => {
+  it("subtracts output generation time from model latency", async () => {
+    const { turnOverheadMs, MS_PER_OUTPUT_TOKEN } = await import("../src/core/metrics.js");
+    const t = { requestedAt: 0, respondedAt: 30_000, outputTokens: 2000 } as Parameters<typeof turnOverheadMs>[0];
+    expect(turnOverheadMs(t)).toBe(30_000 - 2000 * MS_PER_OUTPUT_TOKEN);
+    expect(turnOverheadMs({ ...t, outputTokens: 10_000 })).toBe(0);
+  });
+});
