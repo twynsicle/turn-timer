@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useState } from "react";
 import type { ProjectInfo, Session, SessionInfo } from "../../src/core/types.js";
 import { api, type ProjectStats } from "./api.js";
-import { type DetailTarget, DetailDrawer, Histogram, Tiles, ToolsTable, fmtDate, fmtSize, formatMs, pct, singleClass } from "./common.js";
+import { Caption, type DetailTarget, DetailDrawer, Histogram, SectionRule, Stats, ToolsTable, fmtDate, fmtSize, formatMs, pct, singleClass } from "./common.js";
 import { SessionView } from "./SessionView.js";
 
 interface Route {
@@ -38,6 +38,8 @@ function usePersisted(key: string, initial: boolean): [boolean, (v: boolean) => 
   };
   return [v, set];
 }
+
+const projectName = (cwd: string) => cwd.split(/[\\/]/).filter(Boolean).slice(-2).join("/");
 
 export function App() {
   const [route, setRoute] = useState<Route>(readRoute);
@@ -104,71 +106,81 @@ export function App() {
   });
 
   return (
-    <div className={`app ${detail ? "with-drawer" : ""}`}>
-      <aside className="sidebar">
-        <div className="brand">
-          <span className="brand-mark" aria-hidden>
-            <i />
-            <i />
-            <i />
+    <div className={`shell ${detail ? "with-drawer" : ""}`}>
+      <header className="topbar">
+        <div className="topbar-inner">
+          <span className="brand">
+            <span className="brand-mark" aria-hidden>
+              <i />
+              <i />
+              <i />
+            </span>
+            turn-timer
           </span>
-          turn-timer
+          <label className="project-picker">
+            <span className="sr-only">Project</span>
+            <select value={route.project ?? ""} onChange={(e) => navigate({ project: e.target.value })}>
+              {!projects && <option>Loading…</option>}
+              {projects?.map((p) => (
+                <option key={p.dir} value={p.dir}>
+                  {projectName(p.cwd)} ({p.sessionCount})
+                </option>
+              ))}
+            </select>
+          </label>
+          <label className="toggle">
+            <input type="checkbox" checked={subagents} onChange={(e) => setSubagents(e.target.checked)} />
+            Include subagents
+          </label>
         </div>
-        <label className="field">
-          <span className="field-label">Project</span>
-          <select value={route.project ?? ""} onChange={(e) => navigate({ project: e.target.value })}>
-            {!projects && <option>Loading…</option>}
-            {projects?.map((p) => (
-              <option key={p.dir} value={p.dir}>
-                {p.cwd.split(/[\\/]/).slice(-2).join("/")} ({p.sessionCount})
-              </option>
-            ))}
-          </select>
-        </label>
-        <button className={`nav-item ${route.project && !route.session ? "active" : ""}`} onClick={() => navigate({ project: route.project })}>
-          Project overview
-        </button>
-        <input className="search" placeholder="Filter sessions" value={filter} onChange={(e) => setFilter(e.target.value)} />
-        <div className="session-list">
-          {!sessions && route.project && <div className="muted small pad">Loading sessions…</div>}
-          {shown?.map((s) => (
-            <button
-              key={s.id}
-              className={`session-item ${route.session === s.id ? "active" : ""}`}
-              onClick={() => navigate({ project: route.project, session: s.id })}
-              title={s.firstPrompt}
-            >
-              <span className="session-title">{s.title ?? s.firstPrompt ?? s.id}</span>
-              <span className="session-meta">
-                {fmtDate(s.mtime)} · {fmtSize(s.size)}
-                {s.subagentCount > 0 && ` · ${s.subagentCount} agents`}
-              </span>
-            </button>
-          ))}
-        </div>
-        <label className="toggle">
-          <input type="checkbox" checked={subagents} onChange={(e) => setSubagents(e.target.checked)} />
-          Include subagents
-        </label>
-      </aside>
+      </header>
 
-      <main className="main">
-        {error && <div className="error banner">{error}</div>}
-        {loading && <div className="loading">{loading}</div>}
-        {session && route.project && (
-          <SessionView
-            session={session}
-            project={route.project}
-            subagents={subagents}
-            onOpen={setDetail}
-            selectedCall={detail?.call.id ?? null}
-          />
-        )}
-        {!route.session && project && (
-          <Overview project={project} subagents={subagents} onOpenSession={(id) => navigate({ project: project.dir, session: id })} />
-        )}
-        {projects && !projects.length && <div className="empty">No Claude Code sessions found in ~/.claude/projects.</div>}
-      </main>
+      <div className="layout">
+        <aside className="nav">
+          <button className={`nav-card ${route.project && !route.session ? "active" : ""}`} onClick={() => navigate({ project: route.project })}>
+            <Caption>Project</Caption>
+            <span className="nav-card-title">{project ? projectName(project.cwd) : "…"}</span>
+            <span className="nav-card-sub">Overview across all sessions ›</span>
+          </button>
+
+          <SectionRule label="Sessions" count={sessions?.length} />
+          <input className="search" placeholder="Filter sessions" value={filter} onChange={(e) => setFilter(e.target.value)} />
+          <ol className="session-list">
+            {!sessions && route.project && <li className="muted small">Loading sessions…</li>}
+            {shown?.map((s) => (
+              <li key={s.id}>
+                <button
+                  className="session-item"
+                  data-active={route.session === s.id || undefined}
+                  onClick={() => navigate({ project: route.project, session: s.id })}
+                  title={s.firstPrompt}
+                >
+                  <span className="index">{String(sessions!.indexOf(s) + 1).padStart(2, "0")}</span>
+                  <span className="session-label">
+                    <span className="session-title">{s.title ?? s.firstPrompt ?? s.id}</span>
+                    <span className="session-meta">
+                      {fmtDate(s.mtime)} · {fmtSize(s.size)}
+                      {s.subagentCount > 0 && ` · ${s.subagentCount} agents`}
+                    </span>
+                  </span>
+                </button>
+              </li>
+            ))}
+          </ol>
+        </aside>
+
+        <main className="main">
+          {error && <div className="notice tone-risk">{error}</div>}
+          {loading && <div className="loading">{loading}</div>}
+          {session && route.project && (
+            <SessionView session={session} project={route.project} subagents={subagents} onOpen={setDetail} selectedCall={detail?.call.id ?? null} />
+          )}
+          {!route.session && project && (
+            <Overview project={project} subagents={subagents} onOpenSession={(id) => navigate({ project: project.dir, session: id })} />
+          )}
+          {projects && !projects.length && <div className="empty">No Claude Code sessions found in ~/.claude/projects.</div>}
+        </main>
+      </div>
 
       <DetailDrawer target={detail} onClose={() => setDetail(null)} />
     </div>
@@ -195,78 +207,90 @@ function Overview({ project, subagents, onOpenSession }: { project: ProjectInfo;
 
   const t = stats?.total;
   return (
-    <div className="overview">
+    <article className="page">
       <header className="page-head">
-        <h1>{project.cwd}</h1>
-        <div className="muted small">
-          {project.sessionCount} sessions · last active {fmtDate(project.lastActive)}
-          <span className="seg inline">
-            {[
+        <Caption tone="before">Project</Caption>
+        <h1>{projectName(project.cwd)}</h1>
+        <div className="page-meta">
+          <span className="mono">{project.cwd}</span>
+          <span className="dot">·</span>
+          {project.sessionCount} sessions
+          <span className="dot">·</span>
+          last active {fmtDate(project.lastActive)}
+        </div>
+        <div className="seg">
+          {(
+            [
               [0, "All time"],
-              [7, "7 days"],
-              [30, "30 days"],
-            ].map(([d, label]) => (
-              <button key={d} className={sinceDays === d ? "active" : ""} onClick={() => setSinceDays(d as number)}>
-                {label}
-              </button>
-            ))}
-          </span>
+              [7, "Last 7 days"],
+              [30, "Last 30 days"],
+            ] as const
+          ).map(([d, label]) => (
+            <button key={d} className={sinceDays === d ? "active" : ""} onClick={() => setSinceDays(d)}>
+              {label}
+            </button>
+          ))}
         </div>
       </header>
-      {error && <div className="error banner">{error}</div>}
-      {!stats && !error && <div className="loading">Analyzing sessions… the first run parses every log, later runs use the cache.</div>}
+      {error && <div className="notice tone-risk">{error}</div>}
+      {!stats && !error && <div className="loading">Analyzing sessions. The first run parses every log; later runs use the cache.</div>}
       {t && stats && (
         <>
-          <div className="summary-row">
-            <Tiles
+          <div className="summary">
+            <Stats
               st={t}
-              extra={{ prompts: stats.sessions.reduce((s, r) => s + r.prompts, 0), reminders: stats.sessions.reduce((s, r) => s + r.reminders, 0) }}
               runs={t.runTotals}
+              extra={{ prompts: stats.sessions.reduce((s, r) => s + r.prompts, 0), reminders: stats.sessions.reduce((s, r) => s + r.reminders, 0) }}
             />
             <Histogram histogram={t.histogram} total={t.toolTurns} />
           </div>
-          <p className="muted small">
-            Batching would have saved about <b>{t.savedTurns.toLocaleString()}</b> round-trips and <b>{formatMs(t.savedMs)}</b> of model time.
-          </p>
-          <h3>Sessions</h3>
-          <table className="grid clickable">
-            <thead>
-              <tr>
-                <th>Session</th>
-                <th>Started</th>
-                <th className="r">Turns</th>
-                <th className="r">Calls</th>
-                <th className="r">Avg</th>
-                <th className="r">Single</th>
-                <th className="r">Runs</th>
-                <th className="r">Saveable</th>
-              </tr>
-            </thead>
-            <tbody>
-              {stats.sessions.map((s) => (
-                <tr key={s.id} onClick={() => onOpenSession(s.id)} tabIndex={0} onKeyDown={(e) => e.key === "Enter" && onOpenSession(s.id)}>
-                  <td className="ellipsis-cell" title={s.firstPrompt}>
-                    {s.title ?? s.firstPrompt ?? s.id}
-                  </td>
-                  <td className="muted small nowrap">{fmtDate(s.startedAt)}</td>
-                  <td className="r num">{s.stats.turns.toLocaleString()}</td>
-                  <td className="r num">{s.stats.toolCalls.toLocaleString()}</td>
-                  <td className="r num">{s.stats.avgBatch.toFixed(1)}</td>
-                  <td className={`r num ${singleClass(s.stats.singleCallTurns, s.stats.toolTurns)}`}>{pct(s.stats.singleCallTurns, s.stats.toolTurns)}</td>
-                  <td className="r num">
-                    <span className="bad">{s.stats.runTotals.likely.runs}</span>
-                    <span className="muted">/</span>
-                    <span className="warn">{s.stats.runTotals.possibly.runs}</span>
-                  </td>
-                  <td className="r num">{formatMs(s.stats.savedMs)}</td>
+
+          <section className="section">
+            <SectionRule label="Sessions" count={stats.sessions.length} />
+            <table className="grid clickable">
+              <thead>
+                <tr>
+                  <th>Session</th>
+                  <th>Started</th>
+                  <th className="r">Turns</th>
+                  <th className="r">Calls</th>
+                  <th className="r">Avg</th>
+                  <th className="r">Single</th>
+                  <th className="r">Runs</th>
+                  <th className="r">Saved</th>
                 </tr>
-              ))}
-            </tbody>
-          </table>
-          <h3>Tools</h3>
-          <ToolsTable byTool={t.byTool} />
+              </thead>
+              <tbody>
+                {stats.sessions.map((s) => (
+                  <tr key={s.id} onClick={() => onOpenSession(s.id)} tabIndex={0} onKeyDown={(e) => e.key === "Enter" && onOpenSession(s.id)}>
+                    <td className="ellipsis-cell strong" title={s.firstPrompt}>
+                      {s.title ?? s.firstPrompt ?? s.id}
+                    </td>
+                    <td className="muted nowrap">{fmtDate(s.startedAt)}</td>
+                    <td className="r num">{s.stats.turns.toLocaleString()}</td>
+                    <td className="r num">{s.stats.toolCalls.toLocaleString()}</td>
+                    <td className="r num">{s.stats.avgBatch.toFixed(1)}</td>
+                    <td className={`r num strong ${singleClass(s.stats.singleCallTurns, s.stats.toolTurns)}`}>
+                      {pct(s.stats.singleCallTurns, s.stats.toolTurns)}
+                    </td>
+                    <td className="r num strong">
+                      <span className="bad">{s.stats.runTotals.likely.runs}</span>
+                      <span className="muted"> / </span>
+                      <span className="warn">{s.stats.runTotals.possibly.runs}</span>
+                    </td>
+                    <td className="r num">{formatMs(s.stats.savedMs)}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </section>
+
+          <section className="section">
+            <SectionRule label="Tools" count={Object.keys(t.byTool).length} />
+            <ToolsTable byTool={t.byTool} />
+          </section>
         </>
       )}
-    </div>
+    </article>
   );
 }

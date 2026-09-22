@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { type ReactNode, useEffect, useState } from "react";
 import { BUCKETS, formatMs, pct, type RunTotals, type ToolStat, turnModelMs, turnOverheadMs } from "../../src/core/metrics.js";
 import type { ToolCall, Turn } from "../../src/core/types.js";
 import { api, type Detail } from "./api.js";
@@ -15,14 +15,32 @@ export function fmtSize(bytes: number): string {
   return `${(bytes / (1 << 20)).toFixed(1)} MB`;
 }
 
-/** Severity class for a single-call ratio: lower is better. */
+/** Tone for a single-call ratio: lower is better. */
 export function singleClass(single: number, total: number): string {
   if (!total) return "";
   const r = single / total;
   return r >= 0.5 ? "bad" : r >= 0.3 ? "warn" : "good";
 }
 
-export interface TileStats {
+export type Tone = "muted" | "before" | "risk" | "suggestion" | "praise";
+
+/** The one uppercase label (diffy's Caption): it varies only by tone. */
+export function Caption({ children, tone = "muted" }: { children: ReactNode; tone?: Tone }) {
+  return <span className={`caption tone-${tone}`}>{children}</span>;
+}
+
+/** Ruled section header: caption on the left, a mono count (or controls) on the right. */
+export function SectionRule({ label, count, children }: { label: string; count?: number; children?: ReactNode }) {
+  return (
+    <header className="section-rule">
+      <Caption>{label}</Caption>
+      {children}
+      {count !== undefined && <span className="section-count">{count.toLocaleString()}</span>}
+    </header>
+  );
+}
+
+export interface StatInput {
   turns: number;
   toolTurns: number;
   toolCalls: number;
@@ -33,49 +51,53 @@ export interface TileStats {
   modelMs: number;
 }
 
-export function Tiles({ st, runs, extra }: { st: TileStats; runs?: RunTotals; extra?: { prompts?: number; reminders?: number } }) {
+const TONE_OF: Record<string, Tone | undefined> = { bad: "risk", warn: "suggestion", good: "praise" };
+
+export function Stats({ st, runs, extra }: { st: StatInput; runs?: RunTotals; extra?: { prompts?: number; reminders?: number } }) {
   return (
-    <div className="tiles">
-      <Tile label="Turns" value={st.turns.toLocaleString()} sub={extra?.prompts !== undefined ? `${extra.prompts} prompts` : undefined} />
-      <Tile label="Tool calls" value={st.toolCalls.toLocaleString()} sub={`in ${st.toolTurns.toLocaleString()} tool turns`} />
-      <Tile label="Avg batch" value={st.avgBatch.toFixed(2)} sub={`median ${st.medianBatch} · max ${st.maxBatch}`} />
-      <Tile
+    <dl className="stats">
+      <Stat label="Turns" value={st.turns.toLocaleString()} sub={extra?.prompts !== undefined ? `${extra.prompts} prompts` : undefined} />
+      <Stat label="Tool calls" value={st.toolCalls.toLocaleString()} sub={`in ${st.toolTurns.toLocaleString()} tool turns`} />
+      <Stat label="Avg per turn" value={st.avgBatch.toFixed(2)} sub={`median ${st.medianBatch} · max ${st.maxBatch}`} />
+      <Stat
         label="Single-call turns"
         value={pct(st.singleCallTurns, st.toolTurns)}
-        tone={singleClass(st.singleCallTurns, st.toolTurns)}
+        tone={TONE_OF[singleClass(st.singleCallTurns, st.toolTurns)]}
         sub={`${st.singleCallTurns.toLocaleString()} turns`}
       />
       {runs && (
         <>
-          <Tile
+          <Stat
             label="Likely batchable"
-            value={`${runs.likely.runs}`}
-            tone={runs.likely.runs ? "bad" : "good"}
-            sub={`runs · ${runs.likely.turns} round-trips · ~${formatMs(runs.likely.ms)}`}
+            value={String(runs.likely.runs)}
+            tone={runs.likely.runs ? "risk" : undefined}
+            sub={`${runs.likely.turns} extra round-trips · ~${formatMs(runs.likely.ms)}`}
           />
-          <Tile
+          <Stat
             label="Possibly batchable"
-            value={`${runs.possibly.runs}`}
-            tone={runs.possibly.runs ? "warn" : "good"}
-            sub={`runs · ${runs.possibly.turns} round-trips · ~${formatMs(runs.possibly.ms)}`}
+            value={String(runs.possibly.runs)}
+            tone={runs.possibly.runs ? "suggestion" : undefined}
+            sub={`${runs.possibly.turns} extra round-trips · ~${formatMs(runs.possibly.ms)}`}
           />
         </>
       )}
-      <Tile
+      <Stat
         label="Model time"
         value={formatMs(st.modelMs)}
-        sub={extra?.reminders ? `${extra.reminders} batching reminders from Claude Code` : "sum of response latency"}
+        sub={extra?.reminders ? `${extra.reminders} batching reminders from Claude Code` : "total response time"}
       />
-    </div>
+    </dl>
   );
 }
 
-function Tile({ label, value, sub, tone }: { label: string; value: string; sub?: string; tone?: string }) {
+function Stat({ label, value, sub, tone }: { label: string; value: string; sub?: string; tone?: Tone }) {
   return (
-    <div className={`tile ${tone ?? ""}`}>
-      <div className="tile-label">{label}</div>
-      <div className="tile-value">{value}</div>
-      {sub && <div className="tile-sub">{sub}</div>}
+    <div className="stat">
+      <dt>
+        <Caption>{label}</Caption>
+      </dt>
+      <dd className={`stat-value ${tone ? `tone-${tone}` : ""}`}>{value}</dd>
+      {sub && <dd className="stat-sub">{sub}</dd>}
     </div>
   );
 }
@@ -83,19 +105,21 @@ function Tile({ label, value, sub, tone }: { label: string; value: string; sub?:
 export function Histogram({ histogram, total }: { histogram: number[]; total: number }) {
   const max = Math.max(1, ...histogram);
   return (
-    <div className="histogram" role="table" aria-label="Tool calls per turn">
-      <div className="hist-title">Tool calls per turn</div>
-      {BUCKETS.map((b, i) => (
-        <div className="hist-row" role="row" key={b}>
-          <span className="hist-label">{b}</span>
-          <span className="hist-track">
-            <span className={`hist-bar ${i === 0 ? "single" : ""}`} style={{ width: `${(histogram[i]! / max) * 100}%` }} />
-          </span>
-          <span className="hist-count num">{histogram[i]!.toLocaleString()}</span>
-          <span className="hist-pct num">{pct(histogram[i]!, total)}</span>
-        </div>
-      ))}
-    </div>
+    <section className="histogram" aria-label="Tool calls per turn">
+      <SectionRule label="Tool calls per turn" />
+      <div className="hist-rows">
+        {BUCKETS.map((b, i) => (
+          <div className="hist-row" key={b}>
+            <span className="hist-label">{b}</span>
+            <span className="hist-track">
+              <span className={`hist-bar ${i === 0 ? "single" : ""}`} style={{ width: `${(histogram[i]! / max) * 100}%` }} />
+            </span>
+            <span className="hist-count">{histogram[i]!.toLocaleString()}</span>
+            <span className="hist-pct">{pct(histogram[i]!, total)}</span>
+          </div>
+        ))}
+      </div>
+    </section>
   );
 }
 
@@ -109,21 +133,15 @@ export function ToolsTable({ byTool }: { byTool: Record<string, ToolStat> }) {
           <th className="r">Calls</th>
           <th className="r">Called alone</th>
           <th className="r">Alone %</th>
-          <th className="bar-col" />
         </tr>
       </thead>
       <tbody>
         {rows.map(([name, t]) => (
           <tr key={name}>
-            <td className="mono">{name}</td>
+            <td className="mono strong">{name}</td>
             <td className="r num">{t.calls.toLocaleString()}</td>
             <td className="r num">{t.soloTurns.toLocaleString()}</td>
-            <td className={`r num ${singleClass(t.soloTurns, t.calls)}`}>{pct(t.soloTurns, t.calls)}</td>
-            <td className="bar-col">
-              <span className="mini-track">
-                <span className="mini-bar" style={{ width: `${(t.soloTurns / Math.max(1, t.calls)) * 100}%` }} />
-              </span>
-            </td>
+            <td className={`r num strong ${singleClass(t.soloTurns, t.calls)}`}>{pct(t.soloTurns, t.calls)}</td>
           </tr>
         ))}
       </tbody>
@@ -169,13 +187,14 @@ export function DetailDrawer({ target, onClose }: { target: DetailTarget | null;
     <aside className="drawer" aria-label="Tool call detail">
       <header className="drawer-head">
         <div>
-          <div className="drawer-title mono">{call.name}</div>
-          <div className="drawer-sub">
-            <span className={`cat cat-${call.category}`}>{call.category}</span>
-            {call.readOnly && <span className="pill">read-only</span>}
-            {call.isError && <span className="pill bad">error</span>}
-            {call.denied && <span className="pill bad">denied</span>}
-            {turn.agent.kind === "subagent" && <span className="pill agent">subagent: {turn.agent.agentType}</span>}
+          <Caption tone="before">Tool call</Caption>
+          <div className="drawer-title">{call.name}</div>
+          <div className="drawer-tags">
+            <span className="tag">{call.category}</span>
+            {call.readOnly && <span className="tag">read-only</span>}
+            {call.isError && <span className="tag tone-risk">error</span>}
+            {call.denied && <span className="tag tone-risk">denied</span>}
+            {turn.agent.kind === "subagent" && <span className="tag tone-before">subagent: {turn.agent.agentType}</span>}
           </div>
         </div>
         <button className="icon-btn" onClick={onClose} aria-label="Close">
@@ -183,38 +202,43 @@ export function DetailDrawer({ target, onClose }: { target: DetailTarget | null;
         </button>
       </header>
       <dl className="facts">
-        <dt>Turn batch</dt>
-        <dd>
-          {turn.toolCalls.length} call{turn.toolCalls.length === 1 ? "" : "s"} in this turn
-        </dd>
-        <dt>Model latency</dt>
+        <dt>Calls in this turn</dt>
+        <dd>{turn.toolCalls.length}</dd>
+        <dt>Model time</dt>
         <dd>
           {formatMs(turnModelMs(turn))}
-          <span className="muted"> · {turn.outputTokens.toLocaleString()} output tokens · ~{formatMs(turnOverheadMs(turn))} overhead</span>
+          <span className="muted">
+            {" "}
+            · {turn.outputTokens.toLocaleString()} output tokens · ~{formatMs(turnOverheadMs(turn))} overhead
+          </span>
         </dd>
         <dt>Tool time</dt>
-        <dd>{toolMs !== undefined ? formatMs(toolMs) : "—"}</dd>
-        <dt>Dependency</dt>
+        <dd>{toolMs !== undefined ? formatMs(toolMs) : "–"}</dd>
+        <dt>Depends on</dt>
         <dd>
           {call.refsBack
-            ? `mentions output from ${call.refsBack} turn${call.refsBack === 1 ? "" : "s"} earlier`
-            : "no reference to recent results"}
+            ? `output from ${call.refsBack} turn${call.refsBack === 1 ? "" : "s"} earlier`
+            : "nothing in recent results"}
         </dd>
       </dl>
-      <h4>Input</h4>
-      {error && <div className="error">{error}</div>}
-      {!detail && !error && <div className="muted">Loading…</div>}
-      {detail && <pre className="code">{formatInput(detail.input)}</pre>}
-      <h4>Result</h4>
-      {detail &&
-        (detail.result ? (
-          <>
-            <pre className={`code ${detail.result.isError ? "code-error" : ""}`}>{detail.result.text || "(empty)"}</pre>
-            {detail.result.truncated && <div className="muted">Truncated to 200,000 characters.</div>}
-          </>
-        ) : (
-          <div className="muted">No result recorded.</div>
-        ))}
+      <div className="drawer-section">
+        <SectionRule label="Input" />
+        {error && <div className="error">{error}</div>}
+        {!detail && !error && <div className="muted">Loading…</div>}
+        {detail && <pre className="code">{formatInput(detail.input)}</pre>}
+      </div>
+      <div className="drawer-section">
+        <SectionRule label="Result" />
+        {detail &&
+          (detail.result ? (
+            <>
+              <pre className={`code ${detail.result.isError ? "code-error" : ""}`}>{detail.result.text || "(empty)"}</pre>
+              {detail.result.truncated && <div className="muted small">Truncated to 200,000 characters.</div>}
+            </>
+          ) : (
+            <div className="muted">No result recorded.</div>
+          ))}
+      </div>
     </aside>
   );
 }
