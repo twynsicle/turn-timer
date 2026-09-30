@@ -3,7 +3,7 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import react from "@vitejs/plugin-react";
 import { type Plugin, defineConfig } from "vite";
-import { INDEX_ELEMENT_ID, INDEX_PLACEHOLDER, SESSIONS_DIR } from "./src/core/report-data.js";
+import { DATA_END, INDEX_ELEMENT_ID, INDEX_PLACEHOLDER } from "./src/core/report-data.js";
 
 const OUT_DIR = fileURLToPath(new URL("./dist/report", import.meta.url));
 
@@ -12,7 +12,7 @@ const STYLE_TAG = /<link rel="stylesheet" crossorigin href="\.\/([^"]+\.css)">/g
 
 /**
  * Folds the built JS and CSS into the page and deletes everything else, leaving one
- * `shell.html` that the CLI fills with session data and writes beside the session files.
+ * `shell.html` that the CLI fills with session data.
  */
 function inlineIntoHtml(): Plugin {
   return {
@@ -32,28 +32,20 @@ function inlineIntoHtml(): Plugin {
 }
 
 /**
- * `npm run dev:web` only: serves a report the CLI already generated (REPORT_DIR, default
- * .dev-report): its embedded index goes into the dev page, and its session files are served.
- * Make one with `npm run dev -- --out .dev-report --no-open`.
+ * `npm run dev:web` only: shows a report the CLI already generated (REPORT_FILE, default
+ * claude-sessions-report.html): its embedded data goes into the dev page. Nothing is written.
  */
 function devReport(): Plugin {
-  const dir = process.env.REPORT_DIR ?? ".dev-report";
+  const file = process.env.REPORT_FILE ?? "claude-sessions-report.html";
   return {
     name: "dev-report",
     apply: "serve",
-    configureServer(server) {
-      server.middlewares.use(`/${SESSIONS_DIR}/`, (req, res, next) => {
-        const file = join(dir, SESSIONS_DIR, decodeURIComponent((req.url ?? "").split("?")[0]!.replace(/^\//, "")));
-        if (!existsSync(file) || file.includes("..")) return next();
-        res.setHeader("content-type", "text/javascript");
-        res.end(readFileSync(file));
-      });
-    },
     transformIndexHtml(html) {
-      const file = join(dir, "index.html");
       if (!existsSync(file)) return html;
-      const m = new RegExp(`<script id="${INDEX_ELEMENT_ID}" type="application/json">([\\s\\S]*?)</script>`).exec(readFileSync(file, "utf8"));
-      return m ? html.replace(INDEX_PLACEHOLDER, () => m[0]) : html;
+      const report = readFileSync(file, "utf8");
+      const start = report.indexOf(`<script id="${INDEX_ELEMENT_ID}"`);
+      const end = report.indexOf(DATA_END);
+      return start === -1 || end === -1 ? html : html.replace(INDEX_PLACEHOLDER, () => report.slice(start, end + DATA_END.length));
     },
   };
 }

@@ -3,3 +3,4 @@ dist/
 *.log
 .claude/
 .dev-report/
+claude-sessions-report.html

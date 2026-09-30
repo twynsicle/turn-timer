@@ -1,53 +1,46 @@
 #!/usr/bin/env node
 import { spawn } from "node:child_process";
 import { existsSync } from "node:fs";
-import { mkdir, readFile, readdir, rm, writeFile } from "node:fs/promises";
-import { join, resolve } from "node:path";
+import { readFile, rm, writeFile } from "node:fs/promises";
+import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { Command } from "commander";
 import pc from "picocolors";
-import { loadSession } from "../core/cache.js";
 import { formatUsd } from "../core/cost.js";
 import { listAllSessions, listProjects } from "../core/discover.js";
 import { analyzeSession, formatMs } from "../core/metrics.js";
-import { cacheDir, projectsDir } from "../core/paths.js";
-import {
-  INDEX_ELEMENT_ID,
-  INDEX_PLACEHOLDER,
-  REPORT_VERSION,
-  type ReportIndex,
-  SESSIONS_DIR,
-  SESSION_CALLBACK,
-  type SessionData,
-  type SessionRow,
-  scriptSafeJson,
-  sessionRow,
-  trimPreviews,
-} from "../core/report-data.js";
-import type { SessionInfo } from "../core/types.js";
+import { parseSession } from "../core/parse.js";
+import { projectsDir } from "../core/paths.js";
+import { INDEX_PLACEHOLDER, REPORT_VERSION, type ReportIndex, type SessionRow, dataElements, sessionRow, trimPreviews } from "../core/report-data.js";
+import type { Session } from "../core/types.js";
+
+// Session logs are sensitive. The report file is the only thing this writes: no cache, no
+// temp files, no log files. Console output is progress and totals only, never log contents.
+
+/** Written to the current working directory. */
+const REPORT_FILE = "claude-sessions-report.html";
 
 interface Options {
   since: string;
   project?: string;
-  out: string;
   open: boolean;
-  cache: boolean;
 }
+
+/** An error whose message is ours and safe to print. Anything else may quote a log line. */
+class CliError extends Error {}
 
 const program = new Command()
   .name("claude-sessions")
-  .description("Build an HTML report of your Claude Code sessions: what they cost, where the time went, and cache misses.")
+  .description(`Build an HTML report of your Claude Code sessions (what they cost, where the time went, and cache misses) as ${REPORT_FILE} in the current folder.`)
   .option("-s, --since <days>", "only sessions active in the last N days (0 = all)", "30")
   .option("-p, --project <text>", "only projects whose path contains this text")
-  .option("-o, --out <dir>", "folder to write the report to", join(cacheDir(), "report"))
   .option("--no-open", "don't open the report in a browser")
-  .option("--no-cache", "re-parse every log instead of reusing earlier parses")
   .action((opts: Options) => build(opts))
   .showHelpAfterError();
 
 async function build(opts: Options) {
   const sinceDays = Number(opts.since.replace(/d$/, ""));
-  if (!Number.isFinite(sinceDays) || sinceDays < 0) throw new Error(`--since expects a number of days, got "${opts.since}"`);
+  if (!Number.isFinite(sinceDays) || sinceDays < 0) throw new CliError(`--since expects a number of days, got "${opts.since}"`);
   const since = sinceDays ? Date.now() - sinceDays * 86_400_000 : 0;
   const shell = await reportShell();
 
@@ -55,33 +48,34 @@ async function build(opts: Options) {
   if (opts.project) {
     const needle = opts.project.toLowerCase();
     projects = projects.filter((p) => p.cwd.toLowerCase().includes(needle) || p.dir.toLowerCase().includes(needle));
-    if (!projects.length) throw new Error(`No project path contains "${opts.project}".`);
+    if (!projects.length) throw new CliError(`No project path contains "${opts.project}".`);
   }
   // mtime is never earlier than a log's last record, so it's a safe prefilter.
   const infos = await listAllSessions({ sinceMs: since, projectDirs: projects.map((p) => p.dir) });
-  if (!infos.length) throw new Error(`No sessions found in ${projectsDir()}${sinceDays ? ` in the last ${sinceDays} days` : ""}.`);
-
-  const out = resolve(opts.out);
-  const sessionsDir = join(out, SESSIONS_DIR);
-  await clearSessionsDir(out, sessionsDir);
-  await mkdir(sessionsDir, { recursive: true });
+  if (!infos.length) throw new CliError(`No sessions found in ${projectsDir()}${sinceDays ? ` in the last ${sinceDays} days` : ""}.`);
 
   const started = Date.now();
   const rows: SessionRow[] = [];
+  const sessions = new Map<string, Session>();
   const failed: ReportIndex["failed"] = [];
   const progress = new Progress(infos.length);
   await forEachLimit(infos, 4, async (info) => {
     try {
-      const row = await processSession(info, sessionsDir, opts.cache, since);
-      if (row) rows.push(row);
+      const session = await parseSession(info.path);
+      if (session.prompts.length && session.endedAt >= since) {
+        const row = sessionRow(session, info, analyzeSession(session));
+        rows.push(row);
+        sessions.set(row.key, session);
+      }
     } catch (e) {
-      failed.push({ path: info.path, error: (e as Error).message });
+      failed.push({ path: info.path, error: safeReason(e) });
     }
-    progress.tick(info);
+    progress.tick();
   });
   progress.done();
 
   rows.sort((a, b) => b.endedAt - a.endedAt);
+  trimPreviews(sessions.values());
   const index: ReportIndex = {
     version: REPORT_VERSION,
     generatedAt: Date.now(),
@@ -90,9 +84,8 @@ async function build(opts: Options) {
     sessions: rows,
     failed,
   };
-  const html = injectIndex(shell, index);
-  const file = join(out, "index.html");
-  await writeFile(file, html);
+  const file = resolve(REPORT_FILE);
+  await writeReport(file, fillShell(shell, dataElements(index, sessions)));
 
   const total = rows.reduce((s, r) => s + r.cost.total, 0);
   console.log(
@@ -103,33 +96,27 @@ async function build(opts: Options) {
   if (opts.open) openFile(file);
 }
 
-async function processSession(info: SessionInfo, dir: string, cache: boolean, since: number): Promise<SessionRow | undefined> {
-  const session = await loadSession(info.path, { noCache: !cache });
-  if (!session.prompts.length || session.endedAt < since) return undefined;
-  const row = sessionRow(session, info, analyzeSession(session));
-  const data: SessionData = { key: row.key, session: trimPreviews(session) };
-  await writeFile(join(dir, `${row.key}.js`), `${SESSION_CALLBACK}(${scriptSafeJson(data)});\n`);
-  return row;
+/** Why a log couldn't be read, without the error message: a JSON error can quote the log. */
+function safeReason(e: unknown): string {
+  const code = (e as NodeJS.ErrnoException)?.code;
+  return code ? `couldn't be read (${code})` : `couldn't be parsed (${(e as Error)?.name ?? "error"})`;
 }
 
-function injectIndex(shell: string, index: ReportIndex): string {
+function fillShell(shell: string, data: string): string {
   const at = shell.indexOf(INDEX_PLACEHOLDER);
-  if (at === -1) throw new Error("The report page has no index placeholder; rebuild it with `npm run build`.");
+  if (at === -1) throw new CliError("The report page has no index placeholder; rebuild it with `npm run build`.");
   // Concatenate rather than String.replace: `$&`, `$'` and `$$` in the data would be read as patterns.
-  const close = INDEX_PLACEHOLDER.lastIndexOf("</script>");
-  const filled = INDEX_PLACEHOLDER.slice(0, close) + scriptSafeJson(index) + INDEX_PLACEHOLDER.slice(close);
-  return shell.slice(0, at) + filled + shell.slice(at + INDEX_PLACEHOLDER.length);
+  return shell.slice(0, at) + data + shell.slice(at + INDEX_PLACEHOLDER.length);
 }
 
-/** Empty `<out>/sessions`, but only when it belongs to an earlier report: never someone else's folder. */
-async function clearSessionsDir(out: string, sessionsDir: string) {
-  if (!existsSync(sessionsDir)) return;
-  const page = await readFile(join(out, "index.html"), "utf8").catch(() => "");
-  const ours = (await readdir(sessionsDir)).every((n) => /^[A-Za-z0-9._-]+__[A-Za-z0-9._-]+\.js$/.test(n));
-  if (!page.includes(`id="${INDEX_ELEMENT_ID}"`) && !ours) {
-    throw new Error(`${sessionsDir} already exists and isn't from an earlier report. Choose another --out folder.`);
+/** Write the report, removing it again if the write fails part-way so no partial copy is left. */
+async function writeReport(file: string, html: string) {
+  try {
+    await writeFile(file, html);
+  } catch (e) {
+    await rm(file, { force: true }).catch(() => {});
+    throw new CliError(`Couldn't write ${file}: ${(e as NodeJS.ErrnoException).code ?? (e as Error).name}`);
   }
-  await rm(sessionsDir, { recursive: true, force: true });
 }
 
 /** The built page: dist/report/shell.html, beside this file once built, or under dist in development. */
@@ -138,7 +125,7 @@ async function reportShell(): Promise<string> {
     fileURLToPath(u),
   );
   const found = candidates.find((p) => existsSync(p));
-  if (!found) throw new Error("The report page isn't built yet. Run `npm run build` first.");
+  if (!found) throw new CliError("The report page isn't built yet. Run `npm run build` first.");
   return readFile(found, "utf8");
 }
 
@@ -154,11 +141,10 @@ class Progress {
   private n = 0;
   private readonly tty = process.stderr.isTTY;
   constructor(private readonly total: number) {}
-  tick(info: SessionInfo) {
+  tick() {
     this.n++;
-    if (!this.tty) return;
-    const label = (info.title ?? info.firstPrompt ?? info.id).replace(/\s+/g, " ").slice(0, 50);
-    process.stderr.write(`\r\x1b[2KReading sessions ${this.n}/${this.total}  ${pc.dim(label)}`);
+    // Counts only: titles and prompts are session contents.
+    if (this.tty) process.stderr.write(`\r\x1b[2KReading sessions ${this.n}/${this.total}`);
   }
   done() {
     if (this.tty) process.stderr.write("\r\x1b[2K");
@@ -179,6 +165,7 @@ function openFile(path: string) {
 }
 
 await program.parseAsync().catch((e: Error) => {
-  console.error(pc.red(e.message));
+  // Any other error can carry text from the logs: say only what kind it was.
+  console.error(pc.red(e instanceof CliError ? e.message : `Failed: ${(e as NodeJS.ErrnoException).code ?? e.name}`));
   process.exitCode = 1;
 });

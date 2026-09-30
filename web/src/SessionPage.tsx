@@ -566,6 +566,8 @@ function Drawer({ target, miss, onClose }: { target: Located; miss?: CacheMiss; 
             {turn.usage.fast ? " · fast mode" : ""}
           </span>
         </dd>
+        <dt>Result</dt>
+        <dd>{call.resultChars !== undefined ? `${call.resultChars.toLocaleString()} characters` : "none recorded"}</dd>
         <dt>Calls in turn</dt>
         <dd>{turn.toolCalls.length}</dd>
         {miss && (
@@ -578,12 +580,6 @@ function Drawer({ target, miss, onClose }: { target: Located; miss?: CacheMiss; 
       <div className="drawer-section">
         <SectionRule label="Input" />
         <pre className="code">{call.input || "(none)"}</pre>
-      </div>
-      <div className="drawer-section">
-        <SectionRule label="Result">
-          {call.resultChars !== undefined && <span className="section-count">{call.resultChars.toLocaleString()} characters</span>}
-        </SectionRule>
-        {call.result !== undefined ? <pre className={`code ${call.isError ? "code-error" : ""}`}>{call.result || "(empty)"}</pre> : <div className="muted">No result recorded.</div>}
       </div>
     </aside>
   );

@@ -1,4 +1,4 @@
-import { homedir, platform } from "node:os";
+import { homedir } from "node:os";
 import { join } from "node:path";
 
 export function claudeConfigDir(): string {
@@ -7,16 +7,6 @@ export function claudeConfigDir(): string {
 
 export function projectsDir(): string {
   return join(claudeConfigDir(), "projects");
-}
-
-export function cacheDir(): string {
-  if (process.env.CLAUDE_SESSIONS_CACHE_DIR) return process.env.CLAUDE_SESSIONS_CACHE_DIR;
-  const p = platform();
-  if (p === "win32") {
-    return join(process.env.LOCALAPPDATA || join(homedir(), "AppData", "Local"), "claude-session-viewer", "cache");
-  }
-  if (p === "darwin") return join(homedir(), "Library", "Caches", "claude-session-viewer");
-  return join(process.env.XDG_CACHE_HOME || join(homedir(), ".cache"), "claude-session-viewer");
 }
 
 /**

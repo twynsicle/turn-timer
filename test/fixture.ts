@@ -1,8 +1,15 @@
 // Builds synthetic session logs in the real Claude Code JSONL shape.
 
-import { mkdtempSync, mkdirSync, writeFileSync } from "node:fs";
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { afterAll } from "vitest";
+
+// Every folder writeSession makes is removed when the test file finishes.
+const roots: string[] = [];
+afterAll(() => {
+  for (const r of roots.splice(0)) rmSync(r, { recursive: true, force: true });
+});
 
 type Rec = Record<string, unknown>;
 
@@ -85,6 +92,7 @@ export function writeSession(
   opts: { crlf?: boolean } = {},
 ): { root: string; path: string } {
   const root = mkdtempSync(join(tmpdir(), "turn-timer-test-"));
+  roots.push(root);
   const proj = join(root, "C--proj");
   mkdirSync(proj, { recursive: true });
   const path = join(proj, "sess.jsonl");

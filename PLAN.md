@@ -25,13 +25,14 @@ src/core/
   classify.ts             tool categories, input previews
   cost.ts                 pricing and per-turn cost
   metrics.ts              time, cost by model, per-tool stats, slowest calls, cache-miss detection
-  cache.ts                parsed-session cache keyed by file size and mtime
-  report-data.ts          the index row per session and the per-session data file format
-src/cli/index.ts          build the report: parse (4 at a time), write sessions/<key>.js, inject the index
+  report-data.ts          the index row per session and the embedded data format
+src/cli/index.ts          build the report: parse (4 at a time), embed the index and every session in one HTML file
 web/                      Vite + React page, built into one inlined dist/report/shell.html
 ```
 
-The page embeds the index (one row per session) as JSON and loads a session's full data by script tag when it's opened, which works from `file://`.
+The page embeds the index (one row per session) and each session's data as JSON script elements, parsed when a session is opened. It works from `file://`.
+
+Privacy: the report HTML in the current folder is the only file written. No cache or temp files, console output never quotes the logs, and tool output never enters the report (only its size).
 
 ## Cache-miss detection
 

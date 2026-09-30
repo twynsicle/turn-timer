@@ -1,14 +1,11 @@
 import { readFile } from "node:fs/promises";
 import { basename, dirname, join } from "node:path";
-import { cap, classify, inputText } from "./classify.js";
+import { classify, inputText } from "./classify.js";
 import { subagentFiles } from "./discover.js";
 import { readLines, tryParse } from "./lines.js";
 import { INTERRUPT_PREFIX, NO_PROMPT, blocks, hasToolResults, promptTextOf, toolResultText, ts, userText } from "./records.js";
 import { emptyUsage } from "./cost.js";
 import type { AgentRef, Prompt, Session, SubagentRun, ToolCall, Turn, Usage } from "./types.js";
-
-/** Cap on the result text kept per call. */
-const RESULT_CAP = 1000;
 
 interface StreamState {
   agent: AgentRef;
@@ -111,9 +108,8 @@ function handleToolResults(rec: any, st: StreamState) {
     call.finishedAt = at;
     call.isError = b.is_error === true;
     if (rec.toolDenialKind) call.denied = true;
-    const text = toolResultText(b) || (Array.isArray(b.content) && b.content.length ? "[non-text result]" : "");
-    call.result = cap(text, RESULT_CAP);
-    call.resultChars = text.length;
+    // Only the size: tool output never goes into the report.
+    call.resultChars = toolResultText(b).length;
   }
   if (at) st.lastEventAt = at;
 }

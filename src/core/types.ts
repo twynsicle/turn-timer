@@ -14,9 +14,7 @@ export interface ToolCall {
   summary: string;
   /** The input, readable (a shell command as-is, otherwise JSON), capped. */
   input: string;
-  /** The result text, capped. Undefined when no result was recorded. */
-  result?: string;
-  /** Length of the full result text, before capping. */
+  /** Length of the result text. The text itself is never kept. Undefined when no result was recorded. */
   resultChars?: number;
   startedAt: number;
   finishedAt?: number;

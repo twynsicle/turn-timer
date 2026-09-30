@@ -53,7 +53,7 @@ describe("parseSession", () => {
     expect(s.prompts.map((p) => p.turns[0]!.toolCalls.length)).toEqual([1, 1]);
   });
 
-  it("keeps the whole prompt, and each call's input and result", async () => {
+  it("keeps the whole prompt and each call's input, but only the size of its result", async () => {
     const prompt = "Fix the login bug.\n\nSteps:\n1. open the page\n2. " + "detail ".repeat(100);
     const log = new LogBuilder()
       .prompt(prompt, "p1")
@@ -61,11 +61,12 @@ describe("parseSession", () => {
     const s = await parseSession(writeSession(log).path);
     expect(s.prompts[0]!.text).toBe(prompt.trim());
     const [bash, read] = s.prompts[0]!.turns[0]!.toolCalls;
-    expect(bash).toMatchObject({ summary: "npm test", input: "npm test\n\n# Run tests", result: "3 passed", resultChars: 8 });
+    expect(bash).toMatchObject({ summary: "npm test", input: "npm test\n\n# Run tests", resultChars: 8 });
     expect(read!.input).toContain('"file_path": "/a"');
     expect(read!.resultChars).toBe(5000);
-    expect(read!.result!.length).toBeLessThan(1100);
-    expect(read!.result).toContain("4,000 more characters");
+    // Tool output never reaches the report.
+    expect(JSON.stringify(s)).not.toContain("3 passed");
+    expect(JSON.stringify(s)).not.toContain("yyyy");
   });
 
   it("keeps meta, compact summaries and interrupts inside the current prompt", async () => {
@@ -101,7 +102,7 @@ describe("parseSession", () => {
     expect(s.prompts).toHaveLength(1);
     expect(s.prompts[0]!.interrupted).toBe(true);
     const call = s.prompts[0]!.turns[0]!.toolCalls[0]!;
-    expect(call.result).toBe("done");
+    expect(call.resultChars).toBe(4);
     expect(call.finishedAt! - call.startedAt).toBe(6000);
   });
 
@@ -359,19 +360,17 @@ describe("cost", () => {
 });
 
 describe("trimPreviews", () => {
-  it("shortens previews in busy sessions and keeps the count of what was cut", () => {
-    const calls = Array.from({ length: 40_000 }, () => ({ category: "shell", input: "x".repeat(1000), result: `${"y".repeat(1000)}\n… 4,000 more characters` }));
-    const session = { prompts: [{ turns: [{ calls }] }] } as unknown as Session;
-    trimPreviews(session);
-    expect(calls[0]!.input).toBe(`${"x".repeat(300)}\n… 700 more characters`);
-    expect(calls[0]!.result).toBe(`${"y".repeat(300)}\n… 4,700 more characters`);
+  it("shortens previews when the report has many calls and keeps the count of what was cut", () => {
+    const calls = Array.from({ length: 160_000 }, () => ({ category: "shell", input: `${"x".repeat(1000)}\n… 4,000 more characters` }));
+    trimPreviews([{ prompts: [{ turns: [{ calls }] }] } as unknown as Session]);
+    expect(calls[0]!.input).toBe(`${"x".repeat(300)}\n… 4,700 more characters`);
   });
 
   it("keeps the count of what was cut when only the note is over the budget", () => {
-    // 7,920 calls leave 1,010 characters per preview: the 1,000-character body fits, its note doesn't.
-    const result = `${"y".repeat(1000)}\n… 4,000 more characters`;
-    const calls = Array.from({ length: 7920 }, () => ({ category: "shell", input: "x", result }));
-    trimPreviews({ prompts: [{ turns: [{ calls }] }] } as unknown as Session);
-    expect(calls[0]!.result).toBe(result);
+    // 47,524 calls leave 1,010 characters per preview: the 1,000-character body fits, its note doesn't.
+    const input = `${"x".repeat(1000)}\n… 4,000 more characters`;
+    const calls = Array.from({ length: 47_524 }, () => ({ category: "shell", input }));
+    trimPreviews([{ prompts: [{ turns: [{ calls }] }] } as unknown as Session]);
+    expect(calls[0]!.input).toBe(input);
   });
 });

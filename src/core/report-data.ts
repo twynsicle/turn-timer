@@ -1,22 +1,23 @@
 // What the CLI hands the report page. Pure — shared by the CLI and the page.
 //
-// The page embeds a ReportIndex (one SessionRow per session) and loads each session's full
-// data on demand from `sessions/<key>.js`, a script that calls SESSION_CALLBACK. Script tags
-// work from file://, where fetch() doesn't.
+// The report is one self-contained HTML file. It embeds a ReportIndex (one SessionRow per
+// session) and each session's full data, as JSON script elements the page parses on demand.
 
 import type { Cost } from "./cost.js";
 import { type DailyCost, type SessionAnalysis, type SlowCall, type ToolStat, type Ttl, costByDay } from "./metrics.js";
 import { isMeaningfulPrompt } from "./records.js";
 import type { Session, SessionInfo } from "./types.js";
 
-export const REPORT_VERSION = 3;
+export const REPORT_VERSION = 4;
 export const INDEX_ELEMENT_ID = "session-index";
 export const INDEX_PLACEHOLDER = `<script id="${INDEX_ELEMENT_ID}" type="application/json"></script>`;
-export const SESSION_CALLBACK = "__sessionLoaded";
-export const SESSIONS_DIR = "sessions";
+/** Attribute naming the session (its key) on each session's JSON script element. */
+export const SESSION_ATTR = "data-session";
+/** Follows the last data element, so the dev server can lift the data out of a generated report. */
+export const DATA_END = "<!--/session-data-->";
 
 export interface SessionRow {
-  /** Unique and file-safe: `<projectDir>__<id>`. Names the session's data file. */
+  /** Unique and attribute-safe: `<projectDir>__<id>`. Names the session's data element. */
   key: string;
   id: string;
   projectDir: string;
@@ -61,11 +62,6 @@ export interface ReportIndex {
   sessions: SessionRow[];
   /** Sessions that couldn't be read. */
   failed: { path: string; error: string }[];
-}
-
-export interface SessionData {
-  key: string;
-  session: Session;
 }
 
 export const sessionKey = (projectDir: string, id: string) => `${projectDir}__${id}`.replace(/[^A-Za-z0-9._-]/g, "_");
@@ -113,8 +109,16 @@ export function sessionRow(s: Session, info: SessionInfo, a: SessionAnalysis): S
 /** JSON that can sit inside a <script> element: `<` can't close it once escaped. */
 export const scriptSafeJson = (v: unknown) => JSON.stringify(v).replaceAll("<", "\\u003c");
 
-/** Budget for one session file's input and result previews; busy sessions get shorter previews. */
-const PREVIEW_BUDGET = 16_000_000;
+/** The data elements that replace INDEX_PLACEHOLDER: the index, then one element per session. */
+export function dataElements(index: ReportIndex, sessions: Map<string, Session>): string {
+  const parts = [`<script id="${INDEX_ELEMENT_ID}" type="application/json">${scriptSafeJson(index)}</script>`];
+  for (const [key, session] of sessions) parts.push(`<script type="application/json" ${SESSION_ATTR}="${key}">${scriptSafeJson(session)}</script>`);
+  parts.push(DATA_END);
+  return parts.join("\n");
+}
+
+/** Budget for the tool input previews of the whole report; reports with many calls get shorter previews. */
+const PREVIEW_BUDGET = 48_000_000;
 const MIN_PREVIEW = 300;
 
 const MORE = /\n… ([\d,]+) more characters$/;
@@ -130,22 +134,18 @@ function recap(text: string, max: number): string {
   return `${body.slice(0, max)}\n… ${(full - max).toLocaleString("en-US")} more characters`;
 }
 
-/** Shorten tool previews in place so a session's data file stays loadable. */
-export function trimPreviews(session: Session): Session {
-  const calls: { input: string; result?: string }[] = [];
+/** Shorten tool input previews in place so the report stays loadable. */
+export function trimPreviews(sessions: Iterable<Session>): void {
+  const calls: { input: string }[] = [];
   const walk = (o: unknown) => {
     if (Array.isArray(o)) for (const x of o) walk(x);
     else if (o && typeof o === "object") {
       const r = o as Record<string, unknown>;
-      if (typeof r.category === "string" && typeof r.input === "string") calls.push(r as unknown as { input: string; result?: string });
+      if (typeof r.category === "string" && typeof r.input === "string") calls.push(r as unknown as { input: string });
       for (const v of Object.values(r)) if (v && typeof v === "object") walk(v);
     }
   };
-  walk(session.prompts);
-  const max = Math.max(MIN_PREVIEW, Math.floor(PREVIEW_BUDGET / (2 * (calls.length || 1))));
-  for (const c of calls) {
-    c.input = recap(c.input, max);
-    if (c.result !== undefined) c.result = recap(c.result, max);
-  }
-  return session;
+  for (const s of sessions) walk(s.prompts);
+  const max = Math.max(MIN_PREVIEW, Math.floor(PREVIEW_BUDGET / (calls.length || 1)));
+  for (const c of calls) c.input = recap(c.input, max);
 }

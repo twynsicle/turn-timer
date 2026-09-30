@@ -16,31 +16,16 @@ const SORTS: [Sort, string][] = [
   ["recent", "Recent"],
 ];
 
-function readPref<T extends string>(key: string, allowed: T[], fallback: T): T {
-  try {
-    const v = localStorage.getItem(key) as T | null;
-    return v && allowed.includes(v) ? v : fallback;
-  } catch {
-    return fallback;
-  }
-}
+/** Sort order shared by both lists, for as long as the page is open. Nothing is stored in the browser. */
+let lastSort: Sort = "cost";
 
-function writePref(key: string, v: string) {
-  try {
-    localStorage.setItem(key, v);
-  } catch {
-    // preferences are best-effort
-  }
-}
-
-/** Sort order shared by both lists, remembered across visits. */
 function useSort(): [Sort, (s: Sort) => void] {
-  const [sort, setSort] = useState<Sort>(() => readPref("csv.sort", SORTS.map(([k]) => k), "cost"));
+  const [sort, setSort] = useState<Sort>(lastSort);
   return [
     sort,
     (s) => {
+      lastSort = s;
       setSort(s);
-      writePref("csv.sort", s);
     },
   ];
 }
