@@ -197,6 +197,21 @@ describe("time", () => {
     expect(st.slowest[0]).toMatchObject({ name: "Bash", ms: 1000, promptIndex: 0 });
     expect(st.byTool.Bash).toMatchObject({ calls: 1, totalMs: 1000 });
   });
+
+  it("doesn't count time spent waiting on your answer as work", async () => {
+    const log = new LogBuilder()
+      .prompt("one", "p1") // t=1s
+      .turn("m1", [["AskUserQuestion", { questions: [] }]], { promptId: "p1", toolMs: 8 * 3_600_000 }) // asked 2s, answered 8h + 3s
+      .turn("m2", [["Bash", { command: "npm test" }]], { promptId: "p1" }); // response 8h + 4s, result 8h + 5s
+    const s = await parseSession(writeSession(log).path);
+    expect(promptActiveMs(s.prompts[0]!)).toBe(3000);
+    const st = analyzeSession(s).total;
+    expect(st.waitMs).toBe(8 * 3_600_000 + 1000);
+    expect(st.activeMs).toBe(3000);
+    expect(st.toolMs).toBe(1000);
+    expect(st.slowest.map((c) => c.name)).toEqual(["Bash"]);
+    expect(st.byTool.AskUserQuestion).toMatchObject({ calls: 1, totalMs: 0 });
+  });
 });
 
 describe("cache misses", () => {
@@ -267,6 +282,22 @@ describe("discover", () => {
     expect(projects).toEqual([expect.objectContaining({ dir: "C--proj", cwd: "C:\\proj", sessionCount: 1 })]);
     const sessions = await listSessions("C--proj", root);
     expect(sessions[0]).toMatchObject({ id: "sess", firstPrompt: "hello world", title: "My title", path });
+  });
+
+  it("skips placeholder prompts and housekeeping commands when picking the first prompt", async () => {
+    const cmd = (name: string, args = "") => `<command-name>${name}</command-name>
+<command-args>${args}</command-args>`;
+    const log = new LogBuilder()
+      .turn("m0", [], { text: "resumed" }) // before any prompt: lands in the "(no prompt)" placeholder
+      .prompt(cmd("/clear"), "p1")
+      .prompt(cmd("/model", "opus"), "p2")
+      .prompt(cmd("/deep-review", "the branch"), "p3")
+      .prompt("fix the bug", "p4");
+    const { root, path } = writeSession(log);
+    const s = await parseSession(path);
+    const info = { id: "sess", projectDir: "C--proj", path, size: 1, mtime: 0, subagentCount: 0 };
+    expect(sessionRow(s, info, analyzeSession(s)).firstPrompt).toBe("/deep-review the branch");
+    expect((await listSessions("C--proj", root))[0]!.firstPrompt).toBe("/deep-review the branch");
   });
 });
 

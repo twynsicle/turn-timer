@@ -59,6 +59,25 @@ export function promptTextOf(rec: any): { text: string; kind: PromptKind } | und
   return { text: text.length > PROMPT_CAP ? `${text.slice(0, PROMPT_CAP)}…` : text, kind: "user" };
 }
 
+/** Text of the placeholder prompt that holds turns logged before any prompt (e.g. a resumed session). */
+export const NO_PROMPT = "(no prompt)";
+
+/** Commands that manage the session rather than ask for work; they say nothing about what it was for. */
+const HOUSEKEEPING = new Set(
+  "add-dir agents bug clear compact config context cost doctor effort exit export fast feedback help hooks ide login logout mcp memory model output-style permissions plugin quit release-notes rename resume rewind statusline status terminal-setup theme usage vim"
+    .split(" ")
+    .map((c) => `/${c}`),
+);
+
+/** Whether a prompt says what the session was about: typed text, or a command that asks for work. */
+export function isMeaningfulPrompt(p: { kind: PromptKind; text: string }): boolean {
+  const text = p.text.trim();
+  if (!text || text === NO_PROMPT) return false;
+  if (p.kind === "notification") return false;
+  if (p.kind === "command") return !HOUSEKEEPING.has(text.split(/\s/)[0]!);
+  return true;
+}
+
 /** Text of a tool_result block's content. */
 export function toolResultText(block: any): string {
   const c = block?.content;

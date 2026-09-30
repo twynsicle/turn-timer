@@ -65,8 +65,10 @@ export interface Stats {
   modelMs: number;
   /** Main-thread tool time. Subagents run inside the Agent call that started them. */
   toolMs: number;
-  /** Time Claude spent working on prompts: prompt to last activity, idle time excluded. */
+  /** Time Claude spent working on prompts: prompt to last activity, idle time and user waits excluded. */
   activeMs: number;
+  /** Time tools like AskUserQuestion sat waiting for your answer (not in `activeMs`). */
+  waitMs: number;
   tokens: Tokens;
   /** Estimated cost at API list prices; excludes turns whose model has no known price. */
   cost: Cost;
@@ -90,11 +92,20 @@ export const turnModelMs = (t: Turn) => Math.max(0, t.respondedAt - t.requestedA
 
 export const callMs = (c: ToolCall) => (c.finishedAt ? Math.max(0, c.finishedAt - c.startedAt) : 0);
 
-/** Wall time the turn's tools ran for (parallel calls overlap). */
+/** Tools that block until you answer: their run time is time spent waiting on you, not work. */
+const USER_WAIT_TOOLS = new Set(["AskUserQuestion", "ExitPlanMode"]);
+
+export const waitsOnUser = (c: ToolCall) => USER_WAIT_TOOLS.has(c.name);
+
+/** A call's run time as work: 0 for calls that wait on you. */
+export const workMs = (c: ToolCall) => (waitsOnUser(c) ? 0 : callMs(c));
+
+/** Wall time the turn's tools ran for (parallel calls overlap), leaving out calls that wait on you. */
 export function turnToolMs(t: Turn): number {
   let start = Infinity;
   let end = 0;
   for (const c of t.toolCalls) {
+    if (waitsOnUser(c)) continue;
     start = Math.min(start, c.startedAt);
     if (c.finishedAt) end = Math.max(end, c.finishedAt);
   }
@@ -151,7 +162,18 @@ export function runSpanMs(run: SubagentRun): number {
   return start ? lastActivity(runStreams(run, -1), start) - start : 0;
 }
 
-export const promptActiveMs = (p: Prompt) => (p.turns.length || p.detached?.length ? promptEnd(p) - p.startedAt : 0);
+/** The spans during which the prompt sat waiting on your answer. */
+export function promptWaits(p: Prompt): [number, number][] {
+  const out: [number, number][] = [];
+  for (const s of promptStreams(p)) {
+    for (const t of s.turns) for (const c of t.toolCalls) if (waitsOnUser(c) && c.finishedAt) out.push([c.startedAt, c.finishedAt]);
+  }
+  return out;
+}
+
+/** Prompt to last activity, minus the time spent waiting on your answers. */
+export const promptActiveMs = (p: Prompt) =>
+  p.turns.length || p.detached?.length ? promptEnd(p) - p.startedAt - unionMs(promptWaits(p)) : 0;
 
 const FIVE_MINUTES = 5 * 60_000;
 const ONE_HOUR = 60 * 60_000;
@@ -214,6 +236,7 @@ class StatsBuilder {
   modelMs = 0;
   toolMs = 0;
   activeMs = 0;
+  waitMs = 0;
   tokens = zeroTokens();
   cost = zeroCost();
   unpricedTurns = 0;
@@ -250,7 +273,7 @@ class StatsBuilder {
     }
     for (const call of t.toolCalls) {
       this.toolCalls++;
-      const d = callMs(call);
+      const d = workMs(call);
       const ts = (this.byTool[call.name] ??= { calls: 0, errors: 0, totalMs: 0, maxMs: 0 });
       ts.calls++;
       if (call.isError) ts.errors++;
@@ -284,6 +307,7 @@ class StatsBuilder {
       modelMs: this.modelMs,
       toolMs: this.toolMs,
       activeMs: this.activeMs,
+      waitMs: this.waitMs,
       tokens: this.tokens,
       cost: this.cost,
       unpricedTurns: this.unpricedTurns,
@@ -312,19 +336,25 @@ export function analyzeSession(s: Session): SessionAnalysis {
   const total = new StatsBuilder();
   total.misses = misses;
   const spans: [number, number][] = [];
+  const waits: [number, number][] = [];
   const prompts = s.prompts.map((p) => {
     const b = new StatsBuilder();
+    const pw = promptWaits(p);
+    waits.push(...pw);
+    b.waitMs = unionMs(pw);
     b.activeMs = promptActiveMs(p);
     b.misses = misses.filter((m) => m.promptIndex === p.index);
     for (const st of promptStreams(p)) {
       b.addStream(st);
       total.addStream(st);
     }
-    if (b.activeMs) spans.push([p.startedAt, p.startedAt + b.activeMs]);
+    if (p.turns.length || p.detached?.length) spans.push([p.startedAt, promptEnd(p)]);
     return b.build();
   });
   // A background subagent can keep a prompt running into the next one: count that time once.
-  total.activeMs = unionMs(spans);
+  // Waits always fall inside their prompt's span, so they come straight off the union.
+  total.waitMs = unionMs(waits);
+  total.activeMs = unionMs(spans) - total.waitMs;
   return { total: total.build(), prompts, missByTurn };
 }
 

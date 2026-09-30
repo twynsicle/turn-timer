@@ -1,6 +1,6 @@
 import { memo, useEffect, useMemo, useRef, useState } from "react";
 import { contextTokens, turnCost } from "../../src/core/cost.js";
-import { type CacheMiss, type SessionAnalysis, type Stats, analyzeSession, callMs, runSpanMs, runStats, turnModelMs } from "../../src/core/metrics.js";
+import { type CacheMiss, type SessionAnalysis, type Stats, analyzeSession, callMs, runSpanMs, runStats, turnModelMs, waitsOnUser } from "../../src/core/metrics.js";
 import type { SessionRow } from "../../src/core/report-data.js";
 import type { Prompt, Session, SubagentRun, ToolCall, ToolCategory, Turn } from "../../src/core/types.js";
 import { useSession } from "./data.js";
@@ -122,6 +122,7 @@ function SessionBody({ session, row, focusCall }: { session: Session; row: Sessi
               <>
                 model {formatMs(st.modelMs)} · tools {formatMs(st.toolMs)}
                 <br />
+                {st.waitMs > 0 && `${formatMs(st.waitMs)} waiting on you · `}
                 {formatMs(wallMs)} start to finish
               </>
             }
@@ -287,6 +288,7 @@ const PromptBlock = memo(function PromptBlock({
           {st.turns > 0 && (
             <div className="prompt-facts">
               model {formatMs(st.modelMs)} · tools {formatMs(st.toolMs)} · {plural(st.toolCalls, "tool call")}
+              {st.waitMs > 0 && ` · ${formatMs(st.waitMs)} waiting on you`}
               {st.subagents > 0 && ` · ${plural(st.subagents, "subagent")}`}
             </div>
           )}
@@ -394,7 +396,9 @@ function TurnRow({ t, index, ctx }: { t: Turn; index: number; ctx: Ctx }) {
                 {c.denied && <span className="tag tone-risk">denied</span>}
                 {c.summary || <span className="muted">(no input)</span>}
               </span>
-              <span className="step-time">{c.finishedAt ? formatMs(callMs(c)) : "–"}</span>
+              <span className={`step-time ${waitsOnUser(c) ? "muted" : ""}`} title={waitsOnUser(c) ? "Waiting on your answer; not counted as working time" : undefined}>
+                {c.finishedAt ? formatMs(callMs(c)) : "–"}
+              </span>
             </button>
           </li>
         ))}
@@ -546,7 +550,7 @@ function Drawer({ target, miss, onClose }: { target: Located; miss?: CacheMiss; 
         </button>
       </header>
       <dl className="facts">
-        <dt>Tool time</dt>
+        <dt>{waitsOnUser(call) ? "Waited on you" : "Tool time"}</dt>
         <dd>{call.finishedAt ? formatMs(callMs(call)) : "no result recorded"}</dd>
         <dt>Model time</dt>
         <dd>

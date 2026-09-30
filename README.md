@@ -43,7 +43,10 @@ By default the report goes to `report/` in the cache folder (`%LOCALAPPDATA%\cla
 | **Turn** | One model response, i.e. one API round-trip |
 | **Model time** | Time waiting on the model (main thread only) |
 | **Tool time** | Time from a tool call to its result (main thread only) |
-| **Time working** | Time from each prompt to its last activity, summed. Idle time between prompts isn't counted |
+| **Waiting on you** | Time AskUserQuestion and plan approvals (ExitPlanMode) sat open until you answered. Left out of tool time, time working, the Tools table and the slowest calls |
+| **Time working** | Time from each prompt to its last activity, summed, minus time waiting on you. Idle time between prompts isn't counted |
+
+A session is named by its title if it has one, otherwise by its first meaningful prompt: the first thing you typed or a command that asks for work. Empty prompts, notifications and housekeeping commands like `/clear`, `/login` or `/model` are skipped.
 
 ## Cost
 

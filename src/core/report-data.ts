@@ -6,9 +6,10 @@
 
 import type { Cost } from "./cost.js";
 import { type DailyCost, type SessionAnalysis, type SlowCall, type ToolStat, type Ttl, costByDay } from "./metrics.js";
+import { isMeaningfulPrompt } from "./records.js";
 import type { Session, SessionInfo } from "./types.js";
 
-export const REPORT_VERSION = 2;
+export const REPORT_VERSION = 3;
 export const INDEX_ELEMENT_ID = "session-index";
 export const INDEX_PLACEHOLDER = `<script id="${INDEX_ELEMENT_ID}" type="application/json"></script>`;
 export const SESSION_CALLBACK = "__sessionLoaded";
@@ -32,6 +33,8 @@ export interface SessionRow {
   toolCalls: number;
   subagents: number;
   activeMs: number;
+  /** Time spent waiting on your answers (AskUserQuestion, plan approval); not in `activeMs`. */
+  waitMs: number;
   modelMs: number;
   toolMs: number;
   cost: Cost;
@@ -73,7 +76,7 @@ const SLOWEST_IN_ROW = 5;
 export function sessionRow(s: Session, info: SessionInfo, a: SessionAnalysis): SessionRow {
   const t = a.total;
   const expired = t.misses.filter((m) => m.kind === "expired");
-  const first = s.prompts.find((p) => p.kind === "user")?.text ?? info.firstPrompt;
+  const first = s.prompts.find(isMeaningfulPrompt)?.text ?? info.firstPrompt;
   return {
     key: sessionKey(s.projectDir, s.id),
     id: s.id,
@@ -89,6 +92,7 @@ export function sessionRow(s: Session, info: SessionInfo, a: SessionAnalysis): S
     toolCalls: t.toolCalls,
     subagents: t.subagents,
     activeMs: t.activeMs,
+    waitMs: t.waitMs,
     modelMs: t.modelMs,
     toolMs: t.toolMs,
     cost: t.cost,

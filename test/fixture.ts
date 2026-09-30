@@ -39,12 +39,12 @@ export class LogBuilder {
 
   /**
    * One model turn. Each block becomes its own record sharing the message id, like the real logs.
-   * Tools: [name, input, resultText?]
+   * Tools: [name, input, resultText?]. `toolMs` is how long the tools run before their results.
    */
   turn(
     id: string,
     tools: [string, Rec, string?][],
-    opts: { text?: string; promptId?: string; denied?: boolean; model?: string; usage?: Rec } = {},
+    opts: { text?: string; promptId?: string; denied?: boolean; model?: string; usage?: Rec; toolMs?: number } = {},
   ) {
     // Like the real logs, every record of the response repeats the response's usage.
     const message = (content: Rec[]) => ({ id, model: opts.model ?? "claude-opus-5", role: "assistant", content, ...(opts.usage ? { usage: opts.usage } : {}) });
@@ -54,6 +54,7 @@ export class LogBuilder {
     tools.forEach(([name, input], i) => {
       this.records.push(this.base("assistant", { message: message([{ type: "tool_use", id: `${id}_t${i}`, name, input }]) }));
     });
+    if (opts.toolMs) this.wait(opts.toolMs);
     tools.forEach(([, , result], i) => {
       this.records.push(
         this.base("user", {

@@ -2,7 +2,7 @@ import { readdir, stat, open } from "node:fs/promises";
 import { join } from "node:path";
 import { readLines, tryParse } from "./lines.js";
 import { decodeProjectDir, projectsDir } from "./paths.js";
-import { promptTextOf, ts } from "./records.js";
+import { isMeaningfulPrompt, promptTextOf, ts } from "./records.js";
 import type { ProjectInfo, SessionInfo } from "./types.js";
 
 const HEAD_BYTES = 4 << 20;
@@ -142,7 +142,7 @@ async function scanHead(path: string, dir?: string): Promise<Head> {
     if (rec.type === "custom-title" && rec.customTitle) head.title = rec.customTitle;
     if (!head.firstPrompt && rec.type === "user" && !rec.isSidechain) {
       const p = promptTextOf(rec);
-      if (p) head.firstPrompt = p.text;
+      if (p && isMeaningfulPrompt(p)) head.firstPrompt = p.text;
     }
     const cwdDone = dir ? head.cwds.some((c) => encodeCwd(c) === dir) : !!head.cwd;
     if (cwdDone && head.firstPrompt && head.startedAt) break;

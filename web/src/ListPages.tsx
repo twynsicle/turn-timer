@@ -54,6 +54,7 @@ export function totals(rows: SessionRow[]) {
     byModel: {} as Record<string, number>,
     byDay: {} as DailyCost,
     activeMs: 0,
+    waitMs: 0,
     prompts: 0,
     turns: 0,
     toolCalls: 0,
@@ -70,6 +71,7 @@ export function totals(rows: SessionRow[]) {
     for (const [m, c] of Object.entries(r.costByModel)) t.byModel[m] = (t.byModel[m] ?? 0) + c;
     addDaily(t.byDay, r.costByDay);
     t.activeMs += r.activeMs;
+    t.waitMs += r.waitMs;
     t.prompts += r.prompts;
     t.turns += r.turns;
     t.toolCalls += r.toolCalls;
@@ -118,7 +120,21 @@ function Summary({ t }: { t: Totals }) {
       </div>
       <dl className="stats">
         <Stat label="Sessions" value={t.sessions.toLocaleString()} sub={plural(t.prompts, "prompt")} />
-        <Stat label="Time working" value={formatMs(t.activeMs)} sub={t.prompts ? `${formatMs(t.activeMs / t.prompts)} per prompt` : undefined} />
+        <Stat
+          label="Time working"
+          value={formatMs(t.activeMs)}
+          sub={
+            <>
+              {t.prompts ? `${formatMs(t.activeMs / t.prompts)} per prompt` : undefined}
+              {t.waitMs > 0 && (
+                <>
+                  <br />
+                  {formatMs(t.waitMs)} waiting on you
+                </>
+              )}
+            </>
+          }
+        />
         <Stat label="Turns" value={t.turns.toLocaleString()} sub={plural(t.toolCalls, "tool call")} />
         <Stat
           label="Cache misses"

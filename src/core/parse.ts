@@ -3,7 +3,7 @@ import { basename, dirname, join } from "node:path";
 import { cap, classify, inputText } from "./classify.js";
 import { subagentFiles } from "./discover.js";
 import { readLines, tryParse } from "./lines.js";
-import { INTERRUPT_PREFIX, blocks, hasToolResults, promptTextOf, toolResultText, ts, userText } from "./records.js";
+import { INTERRUPT_PREFIX, NO_PROMPT, blocks, hasToolResults, promptTextOf, toolResultText, ts, userText } from "./records.js";
 import { emptyUsage } from "./cost.js";
 import type { AgentRef, Prompt, Session, SubagentRun, ToolCall, Turn, Usage } from "./types.js";
 
@@ -124,7 +124,7 @@ function currentPrompt(ss: SessionState, at: number): Prompt {
       id: "",
       index: ss.prompts.length,
       kind: "user",
-      text: "(no prompt)",
+      text: NO_PROMPT,
       startedAt: at,
       interrupted: false,
       compacted: false,
