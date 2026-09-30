@@ -41,16 +41,18 @@ export class LogBuilder {
    * One model turn. Each block becomes its own record sharing the message id, like the real logs.
    * Tools: [name, input, resultText?]
    */
-  turn(id: string, tools: [string, Rec, string?][], opts: { text?: string; promptId?: string; denied?: boolean } = {}) {
+  turn(
+    id: string,
+    tools: [string, Rec, string?][],
+    opts: { text?: string; promptId?: string; denied?: boolean; model?: string; usage?: Rec } = {},
+  ) {
+    // Like the real logs, every record of the response repeats the response's usage.
+    const message = (content: Rec[]) => ({ id, model: opts.model ?? "claude-opus-5", role: "assistant", content, ...(opts.usage ? { usage: opts.usage } : {}) });
     if (opts.text) {
-      this.records.push(this.base("assistant", { message: { id, model: "claude-opus-5", role: "assistant", content: [{ type: "text", text: opts.text }] } }));
+      this.records.push(this.base("assistant", { message: message([{ type: "text", text: opts.text }]) }));
     }
     tools.forEach(([name, input], i) => {
-      this.records.push(
-        this.base("assistant", {
-          message: { id, model: "claude-opus-5", role: "assistant", content: [{ type: "tool_use", id: `${id}_t${i}`, name, input }] },
-        }),
-      );
+      this.records.push(this.base("assistant", { message: message([{ type: "tool_use", id: `${id}_t${i}`, name, input }]) }));
     });
     tools.forEach(([, , result], i) => {
       this.records.push(

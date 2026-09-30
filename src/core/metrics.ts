@@ -1,5 +1,6 @@
 // Metrics over the session model. Pure (no Node imports) — shared with the web viewer.
 
+import { type Cost, type Tokens, addCost, addTokens, contextTokens, roundTripCost, turnCost, usageTokens, zeroCost, zeroTokens } from "./cost.js";
 import type { AgentRef, Prompt, Session, ToolCall, Turn } from "./types.js";
 
 export interface MetricOptions {
@@ -29,6 +30,16 @@ export interface BatchableRun {
   savedTurns: number;
   /** Round-trip overhead of the turns after the first — the time batching would have saved. */
   savedMs: number;
+  /** Context re-read cost of the turns after the first — the money batching would have saved. */
+  savedCost: number;
+}
+
+export interface ModelStat {
+  turns: number;
+  tokens: Tokens;
+  /** 0 when the model has no known price. */
+  cost: number;
+  priced: boolean;
 }
 
 export interface ToolStat {
@@ -54,7 +65,16 @@ export interface Stats {
   runs: BatchableRun[];
   savedTurns: number;
   savedMs: number;
+  savedCost: number;
   byTool: Record<string, ToolStat>;
+  tokens: Tokens;
+  /** Estimated cost at API list prices; excludes turns whose model has no known price. */
+  cost: Cost;
+  /** Turns whose model has no known price (not in `cost`). */
+  unpricedTurns: number;
+  /** Largest context (input + cache read + cache write) any single turn read. */
+  peakContext: number;
+  byModel: Record<string, ModelStat>;
 }
 
 export const turnModelMs = (t: Turn) => Math.max(0, t.respondedAt - t.requestedAt);
@@ -71,7 +91,7 @@ export const MS_PER_OUTPUT_TOKEN = 13;
  * processing, time to first token. This is what batching saves — a batched turn still has
  * to generate the same thinking and tool inputs.
  */
-export const turnOverheadMs = (t: Turn) => Math.max(0, turnModelMs(t) - t.outputTokens * MS_PER_OUTPUT_TOKEN);
+export const turnOverheadMs = (t: Turn) => Math.max(0, turnModelMs(t) - t.usage.output * MS_PER_OUTPUT_TOKEN);
 
 export function turnToolMs(t: Turn): number {
   let start = Infinity;
@@ -131,6 +151,7 @@ export function findRuns(turns: Turn[], promptIndex: number): BatchableRun[] {
         tools: calls.map((c) => c.name),
         savedTurns: run.length - 1,
         savedMs: run.slice(1).reduce((s, t) => s + turnOverheadMs(t), 0),
+        savedCost: run.slice(1).reduce((s, t) => s + roundTripCost(t), 0),
       });
     }
     run = [];
@@ -175,11 +196,26 @@ export function computeStats(streams: { turns: Turn[]; promptIndex: number }[]):
   let modelMs = 0;
   let toolMs = 0;
   const runs: BatchableRun[] = [];
+  const tokens = zeroTokens();
+  const cost = zeroCost();
+  let unpricedTurns = 0;
+  let peakContext = 0;
+  const byModel: Record<string, ModelStat> = {};
 
   for (const s of streams) {
     for (const t of s.turns) {
       turns++;
       modelMs += turnModelMs(t);
+      const tt = usageTokens(t.usage);
+      addTokens(tokens, tt);
+      peakContext = Math.max(peakContext, contextTokens(t.usage));
+      const c = turnCost(t);
+      if (c) addCost(cost, c);
+      else unpricedTurns++;
+      const ms = (byModel[t.model || "unknown"] ??= { turns: 0, tokens: zeroTokens(), cost: 0, priced: !!c });
+      ms.turns++;
+      addTokens(ms.tokens, tt);
+      ms.cost += c?.total ?? 0;
       const n = t.toolCalls.length;
       if (!n) continue;
       toolMs += turnToolMs(t);
@@ -209,7 +245,13 @@ export function computeStats(streams: { turns: Turn[]; promptIndex: number }[]):
     runs,
     savedTurns: runs.reduce((s, r) => s + r.savedTurns, 0),
     savedMs: runs.reduce((s, r) => s + r.savedMs, 0),
+    savedCost: runs.reduce((s, r) => s + r.savedCost, 0),
     byTool,
+    tokens,
+    cost,
+    unpricedTurns,
+    peakContext,
+    byModel,
   };
 }
 
@@ -234,7 +276,20 @@ export function mergeStats(parts: Stats[]): Stats {
       acc.soloTurns += t.soloTurns;
     }
   }
-  const sum = (k: "turns" | "toolTurns" | "toolCalls" | "modelMs" | "toolMs" | "savedTurns" | "savedMs") =>
+  const tokens = zeroTokens();
+  const cost = zeroCost();
+  const byModel: Record<string, ModelStat> = {};
+  for (const p of parts) {
+    addTokens(tokens, p.tokens);
+    addCost(cost, p.cost);
+    for (const [name, m] of Object.entries(p.byModel)) {
+      const acc = (byModel[name] ??= { turns: 0, tokens: zeroTokens(), cost: 0, priced: m.priced });
+      acc.turns += m.turns;
+      addTokens(acc.tokens, m.tokens);
+      acc.cost += m.cost;
+    }
+  }
+  const sum = (k: "turns" | "toolTurns" | "toolCalls" | "modelMs" | "toolMs" | "savedTurns" | "savedMs" | "savedCost" | "unpricedTurns") =>
     parts.reduce((s, p) => s + p[k], 0);
   const toolTurns = sum("toolTurns");
   const toolCalls = sum("toolCalls");
@@ -263,7 +318,13 @@ export function mergeStats(parts: Stats[]): Stats {
     runs: parts.flatMap((p) => p.runs),
     savedTurns: sum("savedTurns"),
     savedMs: sum("savedMs"),
+    savedCost: sum("savedCost"),
     byTool,
+    tokens,
+    cost,
+    unpricedTurns: sum("unpricedTurns"),
+    peakContext: Math.max(0, ...parts.map((p) => p.peakContext)),
+    byModel,
   };
 }
 
@@ -287,14 +348,19 @@ export function pct(n: number, d: number): string {
 }
 
 export interface RunTotals {
-  likely: { runs: number; turns: number; ms: number };
-  possibly: { runs: number; turns: number; ms: number };
+  likely: { runs: number; turns: number; ms: number; cost: number };
+  possibly: { runs: number; turns: number; ms: number; cost: number };
 }
 
 export function runTotals(runs: BatchableRun[]): RunTotals {
   const t = (k: RunKind) => {
     const rs = runs.filter((r) => r.kind === k);
-    return { runs: rs.length, turns: rs.reduce((s, r) => s + r.savedTurns, 0), ms: rs.reduce((s, r) => s + r.savedMs, 0) };
+    return {
+      runs: rs.length,
+      turns: rs.reduce((s, r) => s + r.savedTurns, 0),
+      ms: rs.reduce((s, r) => s + r.savedMs, 0),
+      cost: rs.reduce((s, r) => s + r.savedCost, 0),
+    };
   };
   return { likely: t("likely"), possibly: t("possibly") };
 }

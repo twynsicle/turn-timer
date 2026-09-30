@@ -12,9 +12,17 @@ const enc = encodeURIComponent;
 
 export type SlimStats = Omit<Stats, "runs"> & { runTotals: RunTotals };
 
+export type SessionRow = SessionInfo & { startedAt: number; endedAt: number; prompts: number; reminders: number; stats: SlimStats };
+
 export interface ProjectStats {
   total: SlimStats;
-  sessions: (SessionInfo & { prompts: number; reminders: number; stats: SlimStats })[];
+  sessions: SessionRow[];
+}
+
+export interface TopSessions {
+  total: SlimStats;
+  /** Sorted by estimated cost, most expensive first. */
+  sessions: (SessionRow & { project: string })[];
 }
 
 export interface Detail {
@@ -27,6 +35,7 @@ export const api = {
   sessions: (project: string) => get<SessionInfo[]>(`/api/projects/${enc(project)}/sessions`),
   projectStats: (project: string, subagents: boolean, sinceDays = 0) =>
     get<ProjectStats>(`/api/projects/${enc(project)}/stats?subagents=${subagents}&sinceDays=${sinceDays}`),
+  top: (subagents: boolean, sinceDays: number) => get<TopSessions>(`/api/top?subagents=${subagents}&sinceDays=${sinceDays}`),
   session: (project: string, id: string) => get<Session>(`/api/sessions/${enc(project)}/${enc(id)}`),
   detail: (project: string, id: string, c: ToolCall) =>
     get<Detail>(

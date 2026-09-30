@@ -9,10 +9,10 @@ import { loadSession } from "../core/cache.js";
 import type { Config } from "../core/config.js";
 import { listProjects, listSessions, subagentFiles } from "../core/discover.js";
 import { readLineAt, tryParse } from "../core/lines.js";
-import { mergeStats, runTotals, sessionStats } from "../core/metrics.js";
+import { type Stats, mergeStats, runTotals, sessionStats } from "../core/metrics.js";
 import { projectsDir } from "../core/paths.js";
 import { blocks, toolResultText } from "../core/records.js";
-import type { Session } from "../core/types.js";
+import type { Session, SessionInfo } from "../core/types.js";
 
 export interface ServerOptions {
   port: number;
@@ -65,6 +65,40 @@ export async function startServer(opts: ServerOptions): Promise<void> {
     return { session, path };
   };
 
+  interface Row {
+    info: SessionInfo;
+    stats: Stats;
+    prompts: number;
+    reminders: number;
+    startedAt: number;
+    endedAt: number;
+  }
+  const summarize = async (dir: string, infos: SessionInfo[], subagents: boolean): Promise<Row[]> => {
+    const rows: Row[] = [];
+    for (const info of infos) {
+      const { session } = await getSession(dir, info.id);
+      rows.push({
+        info,
+        stats: sessionStats(session, { subagents }),
+        prompts: session.prompts.length,
+        reminders: session.batchingReminders,
+        startedAt: session.startedAt,
+        endedAt: session.endedAt,
+      });
+    }
+    return rows;
+  };
+  // Runs are per-turn detail; the overviews only need counts.
+  const slim = (s: Stats) => ({ ...s, runs: undefined, runTotals: runTotals(s.runs) });
+  const slimRow = (r: Row) => ({
+    ...r.info,
+    startedAt: r.startedAt,
+    endedAt: r.endedAt,
+    prompts: r.prompts,
+    reminders: r.reminders,
+    stats: slim(r.stats),
+  });
+
   const projectDir = async (raw: string): Promise<string> => {
     const dir = decodeURIComponent(raw);
     if (!SAFE_SEGMENT.test(dir)) throw new HttpError(400, "bad project");
@@ -90,19 +124,27 @@ export async function startServer(opts: ServerOptions): Promise<void> {
         const subagents = url.searchParams.get("subagents") !== "false";
         let infos = await listSessions(dir);
         if (since > 0) infos = infos.filter((s) => s.mtime >= Date.now() - since * 86400e3);
-        const rows = [];
-        for (const info of infos) {
-          const { session } = await getSession(dir, info.id);
-          const st = sessionStats(session, { subagents });
-          rows.push({ info, stats: st, prompts: session.prompts.length, reminders: session.batchingReminders });
-        }
+        const rows = await summarize(dir, infos, subagents);
         const total = mergeStats(rows.map((r) => r.stats));
-        // Runs are per-turn detail; the overview only needs counts.
-        const slim = (s: typeof total) => ({ ...s, runs: undefined, runTotals: runTotals(s.runs) });
-        return {
-          total: slim(total),
-          sessions: rows.map((r) => ({ ...r.info, prompts: r.prompts, reminders: r.reminders, stats: slim(r.stats) })),
-        };
+        return { total: slim(total), sessions: rows.map(slimRow) };
+      },
+    ],
+    [
+      /^\/api\/top$/,
+      async (_m, url) => {
+        const days = Number(url.searchParams.get("sinceDays") ?? 30);
+        const subagents = url.searchParams.get("subagents") !== "false";
+        const since = days > 0 ? Date.now() - days * 86400e3 : 0;
+        const projects = await listProjects();
+        const rows: (Row & { project: string })[] = [];
+        for (const p of projects) {
+          // mtime is never earlier than the last record, so it's a safe prefilter.
+          const infos = (await listSessions(p.dir)).filter((s) => s.mtime >= since);
+          for (const r of await summarize(p.dir, infos, subagents)) if (r.endedAt >= since) rows.push({ ...r, project: p.cwd });
+        }
+        rows.sort((a, b) => b.stats.cost.total - a.stats.cost.total);
+        const total = mergeStats(rows.map((r) => r.stats));
+        return { total: slim(total), sessions: rows.map((r) => ({ ...slimRow(r), project: r.project })) };
       },
     ],
     [

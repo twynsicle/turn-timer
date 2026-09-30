@@ -3,6 +3,7 @@ import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { isReadOnlyCommand } from "../src/core/classify.js";
 import { DEFAULT_CONFIG } from "../src/core/config.js";
+import { emptyUsage, priceOf } from "../src/core/cost.js";
 import { listProjects, listSessions } from "../src/core/discover.js";
 import { readLineAt, readLines } from "../src/core/lines.js";
 import { findRuns, promptStats, sessionStats } from "../src/core/metrics.js";
@@ -191,8 +192,70 @@ describe("discover", () => {
 describe("turnOverheadMs", () => {
   it("subtracts output generation time from model latency", async () => {
     const { turnOverheadMs, MS_PER_OUTPUT_TOKEN } = await import("../src/core/metrics.js");
-    const t = { requestedAt: 0, respondedAt: 30_000, outputTokens: 2000 } as Parameters<typeof turnOverheadMs>[0];
+    const t = { requestedAt: 0, respondedAt: 30_000, usage: { ...emptyUsage(), output: 2000 } } as Parameters<typeof turnOverheadMs>[0];
     expect(turnOverheadMs(t)).toBe(30_000 - 2000 * MS_PER_OUTPUT_TOKEN);
-    expect(turnOverheadMs({ ...t, outputTokens: 10_000 })).toBe(0);
+    expect(turnOverheadMs({ ...t, usage: { ...t.usage, output: 10_000 } })).toBe(0);
+  });
+});
+
+describe("cost", () => {
+  const usage = (o: Record<string, unknown>) => ({
+    input_tokens: 10,
+    cache_creation_input_tokens: 3000,
+    cache_read_input_tokens: 100_000,
+    output_tokens: 500,
+    cache_creation: { ephemeral_5m_input_tokens: 1000, ephemeral_1h_input_tokens: 2000 },
+    ...o,
+  });
+
+  it("counts each response's usage once, though it repeats on every record", async () => {
+    const log = new LogBuilder()
+      .prompt("go", "p1")
+      .turn("m1", [["Read", { file_path: "/a" }], ["Read", { file_path: "/b" }]], { text: "hi", promptId: "p1", usage: usage({}) });
+    const s = await parseSession(writeSession(log).path, cfg);
+    const t = s.prompts[0]!.turns[0]!;
+    expect(t.usage).toMatchObject({ input: 10, cacheWrite5m: 1000, cacheWrite1h: 2000, cacheRead: 100_000, output: 500 });
+    const st = sessionStats(s);
+    expect(st.tokens).toEqual({ input: 10, cacheWrite: 3000, cacheRead: 100_000, output: 500 });
+    // Opus 5: $5 in, $25 out, $0.50 cache read; writes 1.25× / 2× input.
+    const expected = (10 * 5 + 1000 * 5 * 1.25 + 2000 * 5 * 2 + 100_000 * 0.5 + 500 * 25) / 1e6;
+    expect(st.cost.total).toBeCloseTo(expected, 10);
+    expect(st.peakContext).toBe(103_010);
+    expect(st.byModel["claude-opus-5"]).toMatchObject({ turns: 1, priced: true });
+  });
+
+  it("treats writes without a TTL breakdown as 5-minute, applies fast mode, and skips unknown models", async () => {
+    const log = new LogBuilder()
+      .prompt("go", "p1")
+      .turn("m1", [], { text: "a", usage: usage({ cache_creation: undefined, speed: "fast" }) })
+      .turn("m2", [], { text: "b", model: "claude-opus-9", usage: usage({}) });
+    const s = await parseSession(writeSession(log).path, cfg);
+    const [t1] = s.prompts[0]!.turns;
+    expect(t1!.usage).toMatchObject({ cacheWrite5m: 3000, cacheWrite1h: 0, fast: true });
+    const st = sessionStats(s);
+    expect(st.unpricedTurns).toBe(1);
+    expect(st.cost.total).toBeCloseTo((2 * (10 * 5 + 3000 * 5 * 1.25 + 100_000 * 0.5 + 500 * 25)) / 1e6, 10);
+  });
+
+  it("prices batchable runs by the context re-reads of the extra turns", async () => {
+    const u = usage({ cache_creation_input_tokens: 0, cache_creation: undefined });
+    const log = new LogBuilder()
+      .prompt("explore", "p1")
+      .turn("m1", [["Read", { file_path: "/p/a.ts" }]], { promptId: "p1", usage: u })
+      .turn("m2", [["Read", { file_path: "/p/b.ts" }]], { promptId: "p1", usage: u })
+      .turn("m3", [["Read", { file_path: "/p/c.ts" }]], { promptId: "p1", usage: u });
+    const st = sessionStats(await parseSession(writeSession(log).path, cfg));
+    expect(st.runs[0]!.savedCost).toBeCloseTo((2 * (10 * 5 + 100_000 * 0.5)) / 1e6, 10);
+    expect(st.savedCost).toBe(st.runs[0]!.savedCost);
+  });
+
+  it("resolves dated, provider-prefixed and unknown model ids", () => {
+    expect(priceOf("claude-haiku-4-5-20251001")).toEqual(priceOf("claude-haiku-4-5"));
+    expect(priceOf("us.anthropic.claude-opus-4-8-v1:0")).toEqual(priceOf("claude-opus-4-8"));
+    expect(priceOf("claude-opus-4-5@20251101")).toEqual(priceOf("claude-opus-4-5"));
+    expect(priceOf("claude-opus-5-5[1m]")?.input).toBe(4);
+    expect(priceOf("claude-opus-5")?.input).toBe(5);
+    expect(priceOf("claude-opus-4-9")).toBeUndefined();
+    expect(priceOf("<synthetic>")).toBeUndefined();
   });
 });

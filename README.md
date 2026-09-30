@@ -1,8 +1,8 @@
 # turn-timer
 
-Inspect Claude Code session logs to see **how many tool calls Claude batches into each model round-trip**, and where it made serial round-trips it didn't need to.
+Inspect Claude Code session logs to find where sessions go wrong: **which sessions cost the most**, and **where Claude made serial round-trips it didn't need to**.
 
-Claude Code's UI doesn't show batching. turn-timer reads the JSONL transcripts in `~/.claude/projects` and breaks each session down by prompt and turn, then flags streaks of single-call turns that could have been a single batched turn.
+turn-timer reads the JSONL transcripts in `~/.claude/projects` and breaks each session down by prompt and turn. It estimates each session's cost from the token usage in the logs, ranks sessions across all projects, and flags streaks of single-call turns that could have been one batched turn.
 
 ## Terms
 
@@ -14,6 +14,16 @@ Claude Code's UI doesn't show batching. turn-timer reads the JSONL transcripts i
 | **Batchable run** | 2+ consecutive single-call turns whose calls didn't depend on each other |
 
 Runs are **likely** batchable when every call is read-only (Read, Grep, Glob, WebFetch, read-only shell commands). They are **possibly** batchable when they include edits to different files. A run breaks when a call mentions a path or pattern that appeared in an earlier result within the run, since that call probably needed the result.
+
+## Cost
+
+Every model response in the logs records its token usage: uncached input, cache writes (5-minute and 1-hour), cache reads and output. turn-timer counts each response once and prices it at Anthropic API list prices ([src/core/cost.ts](src/core/cost.ts)). Cache writes cost 1.25× the input rate (5-minute) or 2× (1-hour). Fast mode costs 2×. Web searches cost $10 per 1,000. Subagent usage counts toward the session that spawned it. Turns on a model with no known price are left out of the total and reported separately.
+
+This is an estimate at API rates, not a bill. On a Pro or Max subscription, it still ranks sessions by how much usage they consumed.
+
+In long sessions, **cache reads usually dominate**: every turn re-reads the whole cached context. That's also why an unnecessary round-trip costs money. A batchable run's "cost saved" is the context re-read (uncached input plus cache reads) of each extra turn. A batched turn would still pay for the output and the new cache writes.
+
+## Batching
 
 "Time saved" is each extra turn's round-trip overhead: its latency minus the time spent generating output (13 ms per output token, calibrated from real sessions). A batched turn would still generate the same thinking and tool inputs, so only the overhead is saved.
 
@@ -33,6 +43,8 @@ This works the same on Windows and macOS. For development without installing, us
 
 ```bash
 turn-timer                                # interactive: pick project → session → expand prompts
+turn-timer top                            # most expensive sessions across all projects (last 30 days)
+turn-timer top --since 7d -n 10 -p "alien loot"
 turn-timer projects
 turn-timer sessions "alien loot"          # project by index, folder name or path fragment
 turn-timer show 5ec54f26                  # per-prompt table (session id prefix, title fragment)
@@ -49,8 +61,9 @@ Global flags: `--json`, `--no-subagents`, `--no-cache`, `--config <path>`.
 
 `turn-timer serve` opens a local viewer (bound to 127.0.0.1):
 
-- **Project overview:** batching stats across every session, the per-session table and the per-tool table.
-- **Session view:** summary tiles, the batch-size histogram, and one row per prompt. Expand a prompt to see its turn timeline:
+- **Most expensive sessions** (the landing page): every session across all projects, ranked by estimated cost. It shows each session's peak context, cost per turn, cache-read share and what batching would have saved, plus a total cost breakdown by token kind and model.
+- **Project overview:** cost and batching stats across every session, the per-session table (sortable by cost) and the per-tool table.
+- **Session view:** summary tiles, the cost breakdown, the batch-size histogram, and one row per prompt with its cost. Expand a prompt to see its turn timeline:
   - batch-size badges and tool chips
   - timing bars (model latency vs tool time)
   - flagged runs highlighted

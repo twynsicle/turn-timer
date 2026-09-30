@@ -116,14 +116,17 @@ Parallel tool calls split across lines · user interrupts (`[Request interrupted
 
 ## Milestones
 
-Status (2026-09-21): 1–4 done. Remaining: test on macOS, packaging polish.
+Status (2026-09-29): 1–4 done, plus cost estimates (6). Remaining: test on macOS, packaging polish.
 
 1. **Core:** paths, discover, stream parse and model, with vitest tests on the fixtures. Check against the prototype numbers (Alien Loot main thread: about 53% single-call turns).
 2. **CLI:** `projects`, `sessions`, `show`, and the interactive picker.
 3. **Metrics:** batchable-run detection, `stats` across a project, and the summary cache.
 4. **Viewer:** server, API and the React viewer with drill-down and the detail panel.
 5. **Polish:** a test run on macOS, README, `npm i -g` packaging, and tuning the config file.
+6. **Cost:** per-turn token usage and estimated cost at API list prices (`core/cost.ts`), `turn-timer top` and the viewer landing page ranking sessions across all projects by cost, and the cost of batchable runs.
+
+Direction (2026-09-29): the project is broadening from batching alone to finding Claude Code issues in general. Cost is the entry point for picking which sessions to dig into.
 
 ## Later ideas
 
-Compare sessions or time periods (did a CLAUDE.md change improve batching?), token and cost per turn, per-model comparisons, a live "tail" mode for the current session, and export of flagged runs as examples for prompt tuning.
+Compare sessions or time periods (did a CLAUDE.md change improve batching?), per-model comparisons, other issue detectors (context bloat, retry loops, repeated failing commands, compaction churn), a live "tail" mode for the current session, and export of flagged runs as examples for prompt tuning.

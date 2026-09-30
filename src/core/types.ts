@@ -46,7 +46,21 @@ export interface Turn {
   toolCalls: ToolCall[];
   hasText: boolean;
   hasThinking: boolean;
-  outputTokens: number;
+  usage: Usage;
+}
+
+/** Token usage of one model response, from the API's `usage` block. */
+export interface Usage {
+  /** Uncached input tokens. */
+  input: number;
+  cacheWrite5m: number;
+  cacheWrite1h: number;
+  cacheRead: number;
+  /** Output tokens, thinking included. */
+  output: number;
+  webSearches: number;
+  /** Served in fast mode (priced higher). */
+  fast: boolean;
 }
 
 export type PromptKind = "user" | "command" | "notification";

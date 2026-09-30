@@ -1,7 +1,23 @@
 import { useCallback, useEffect, useState } from "react";
 import type { ProjectInfo, Session, SessionInfo } from "../../src/core/types.js";
-import { api, type ProjectStats } from "./api.js";
-import { Caption, type DetailTarget, DetailDrawer, Histogram, SectionRule, Stats, ToolsTable, fmtDate, fmtSize, formatMs, pct, singleClass } from "./common.js";
+import { api, type ProjectStats, type SessionRow, type TopSessions } from "./api.js";
+import {
+  Caption,
+  CostPanel,
+  type DetailTarget,
+  DetailDrawer,
+  Histogram,
+  SectionRule,
+  Stats,
+  ToolsTable,
+  fmtDate,
+  fmtSize,
+  formatMs,
+  formatTokens,
+  formatUsd,
+  pct,
+  singleClass,
+} from "./common.js";
 import { SessionView } from "./SessionView.js";
 
 interface Route {
@@ -67,17 +83,20 @@ export function App() {
     api.projects().then(setProjects, (e: Error) => setError(e.message));
   }, []);
 
-  // Default to the most recently active project.
+  // The sidebar lists the current project's sessions; on the all-projects page, the last
+  // project viewed (or the most recently active one).
+  const [lastProject, setLastProject] = useState<string | undefined>(route.project);
   useEffect(() => {
-    if (!route.project && projects?.length) navigate({ project: projects[0]!.dir });
-  }, [projects, route.project, navigate]);
+    if (route.project) setLastProject(route.project);
+  }, [route.project]);
+  const sideProject = route.project ?? lastProject ?? projects?.[0]?.dir;
 
   useEffect(() => {
     setSessions(null);
     setFilter("");
-    if (!route.project) return;
-    api.sessions(route.project).then(setSessions, (e: Error) => setError(e.message));
-  }, [route.project]);
+    if (!sideProject) return;
+    api.sessions(sideProject).then(setSessions, (e: Error) => setError(e.message));
+  }, [sideProject]);
 
   useEffect(() => {
     setSession(null);
@@ -99,6 +118,7 @@ export function App() {
   }, [route.project, route.session]);
 
   const project = projects?.find((p) => p.dir === route.project);
+  const sidebarProject = projects?.find((p) => p.dir === sideProject);
   const shown = sessions?.filter((s) => {
     if (!filter) return true;
     const hay = `${s.id} ${s.title ?? ""} ${s.firstPrompt ?? ""}`.toLowerCase();
@@ -119,7 +139,7 @@ export function App() {
           </span>
           <label className="project-picker">
             <span className="sr-only">Project</span>
-            <select value={route.project ?? ""} onChange={(e) => navigate({ project: e.target.value })}>
+            <select value={sideProject ?? ""} onChange={(e) => navigate({ project: e.target.value })}>
               {!projects && <option>Loading…</option>}
               {projects?.map((p) => (
                 <option key={p.dir} value={p.dir}>
@@ -137,22 +157,27 @@ export function App() {
 
       <div className="layout">
         <aside className="nav">
-          <button className={`nav-card ${route.project && !route.session ? "active" : ""}`} onClick={() => navigate({ project: route.project })}>
+          <button className={`nav-card ${!route.project ? "active" : ""}`} onClick={() => navigate({})}>
+            <Caption>All projects</Caption>
+            <span className="nav-card-title">Most expensive sessions</span>
+            <span className="nav-card-sub">Ranked by estimated cost ›</span>
+          </button>
+          <button className={`nav-card ${route.project && !route.session ? "active" : ""}`} onClick={() => navigate({ project: sideProject })}>
             <Caption>Project</Caption>
-            <span className="nav-card-title">{project ? projectName(project.cwd) : "…"}</span>
+            <span className="nav-card-title">{sidebarProject ? projectName(sidebarProject.cwd) : "…"}</span>
             <span className="nav-card-sub">Overview across all sessions ›</span>
           </button>
 
           <SectionRule label="Sessions" count={sessions?.length} />
           <input className="search" placeholder="Filter sessions" value={filter} onChange={(e) => setFilter(e.target.value)} />
           <ol className="session-list">
-            {!sessions && route.project && <li className="muted small">Loading sessions…</li>}
+            {!sessions && sideProject && <li className="muted small">Loading sessions…</li>}
             {shown?.map((s) => (
               <li key={s.id}>
                 <button
                   className="session-item"
                   data-active={route.session === s.id || undefined}
-                  onClick={() => navigate({ project: route.project, session: s.id })}
+                  onClick={() => navigate({ project: sideProject, session: s.id })}
                   title={s.firstPrompt}
                 >
                   <span className="index">{String(sessions!.indexOf(s) + 1).padStart(2, "0")}</span>
@@ -175,6 +200,9 @@ export function App() {
           {session && route.project && (
             <SessionView session={session} project={route.project} subagents={subagents} onOpen={setDetail} selectedCall={detail?.call.id ?? null} />
           )}
+          {!route.project && projects && projects.length > 0 && (
+            <TopView subagents={subagents} onOpenSession={(dir, id) => navigate({ project: dir, session: id })} />
+          )}
           {!route.session && project && (
             <Overview project={project} subagents={subagents} onOpenSession={(id) => navigate({ project: project.dir, session: id })} />
           )}
@@ -191,6 +219,7 @@ function Overview({ project, subagents, onOpenSession }: { project: ProjectInfo;
   const [stats, setStats] = useState<ProjectStats | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [sinceDays, setSinceDays] = useState(0);
+  const [sort, setSort] = useState<"newest" | "cost">("newest");
 
   useEffect(() => {
     setStats(null);
@@ -242,11 +271,27 @@ function Overview({ project, subagents, onOpenSession }: { project: ProjectInfo;
               runs={t.runTotals}
               extra={{ prompts: stats.sessions.reduce((s, r) => s + r.prompts, 0), reminders: stats.sessions.reduce((s, r) => s + r.reminders, 0) }}
             />
-            <Histogram histogram={t.histogram} total={t.toolTurns} />
+            <div className="summary-side">
+              <CostPanel st={t} />
+              <Histogram histogram={t.histogram} total={t.toolTurns} />
+            </div>
           </div>
 
           <section className="section">
-            <SectionRule label="Sessions" count={stats.sessions.length} />
+            <SectionRule label="Sessions" count={stats.sessions.length}>
+              <div className="seg seg-inline">
+                {(
+                  [
+                    ["newest", "Newest"],
+                    ["cost", "Most expensive"],
+                  ] as const
+                ).map(([k, label]) => (
+                  <button key={k} className={sort === k ? "active" : ""} onClick={() => setSort(k)}>
+                    {label}
+                  </button>
+                ))}
+              </div>
+            </SectionRule>
             <table className="grid clickable">
               <thead>
                 <tr>
@@ -258,10 +303,11 @@ function Overview({ project, subagents, onOpenSession }: { project: ProjectInfo;
                   <th className="r">Single</th>
                   <th className="r">Runs</th>
                   <th className="r">Saved</th>
+                  <th className="r">Cost</th>
                 </tr>
               </thead>
               <tbody>
-                {stats.sessions.map((s) => (
+                {sortRows(stats.sessions, sort).map((s) => (
                   <tr key={s.id} onClick={() => onOpenSession(s.id)} tabIndex={0} onKeyDown={(e) => e.key === "Enter" && onOpenSession(s.id)}>
                     <td className="ellipsis-cell strong" title={s.firstPrompt}>
                       {s.title ?? s.firstPrompt ?? s.id}
@@ -279,6 +325,7 @@ function Overview({ project, subagents, onOpenSession }: { project: ProjectInfo;
                       <span className="warn">{s.stats.runTotals.possibly.runs}</span>
                     </td>
                     <td className="r num">{formatMs(s.stats.savedMs)}</td>
+                    <td className="r num strong">{formatUsd(s.stats.cost.total)}</td>
                   </tr>
                 ))}
               </tbody>
@@ -292,5 +339,150 @@ function Overview({ project, subagents, onOpenSession }: { project: ProjectInfo;
         </>
       )}
     </article>
+  );
+}
+
+const sortRows = <T extends SessionRow>(rows: T[], sort: "newest" | "cost") =>
+  sort === "cost" ? [...rows].sort((a, b) => b.stats.cost.total - a.stats.cost.total) : rows;
+
+const RANGES = [
+  [7, "Last 7 days"],
+  [30, "Last 30 days"],
+  [0, "All time"],
+] as const;
+
+/** Sessions across every project, most expensive first: where to start digging. */
+function TopView({ subagents, onOpenSession }: { subagents: boolean; onOpenSession: (project: string, id: string) => void }) {
+  const [data, setData] = useState<TopSessions | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [sinceDays, setSinceDays] = useState(30);
+  const [limit, setLimit] = useState(25);
+
+  useEffect(() => {
+    setData(null);
+    setError(null);
+    let live = true;
+    api
+      .top(subagents, sinceDays)
+      .then((d) => live && setData(d))
+      .catch((e: Error) => live && setError(e.message));
+    return () => {
+      live = false;
+    };
+  }, [subagents, sinceDays]);
+
+  const t = data?.total;
+  const rows = data?.sessions ?? [];
+  const top5 = rows.slice(0, 5).reduce((s, r) => s + r.stats.cost.total, 0);
+  const maxCost = rows[0]?.stats.cost.total ?? 0;
+  return (
+    <article className="page">
+      <header className="page-head">
+        <Caption tone="before">All projects</Caption>
+        <h1>Most expensive sessions</h1>
+        <div className="page-meta">Estimated at Anthropic API list prices, from the token usage recorded in each session log.</div>
+        <div className="seg">
+          {RANGES.map(([d, label]) => (
+            <button key={d} className={sinceDays === d ? "active" : ""} onClick={() => setSinceDays(d)}>
+              {label}
+            </button>
+          ))}
+        </div>
+      </header>
+      {error && <div className="notice tone-risk">{error}</div>}
+      {!data && !error && <div className="loading">Analyzing every session. The first run parses all logs; later runs use the cache.</div>}
+      {t && data && (
+        <>
+          <div className="summary">
+            <dl className="stats">
+              <TopStat label="Sessions" value={rows.length.toLocaleString()} sub={`${t.turns.toLocaleString()} turns`} />
+              <TopStat label="Total" value={formatUsd(t.cost.total)} sub={rows.length ? `${formatUsd(t.cost.total / rows.length)} per session` : undefined} />
+              <TopStat label="Top 5 sessions" value={pct(top5, t.cost.total)} sub={`${formatUsd(top5)} of the total`} />
+              <TopStat label="Peak context" value={formatTokens(t.peakContext)} sub="largest single turn" />
+              <TopStat
+                label="Batching could save"
+                value={`~${formatUsd(t.savedCost)}`}
+                sub={`${pct(t.savedCost, t.cost.total)} · ${t.savedTurns.toLocaleString()} round-trips`}
+              />
+            </dl>
+            <CostPanel st={t} />
+          </div>
+
+          <section className="section">
+            <SectionRule label="Sessions by cost" count={rows.length} />
+            <table className="grid clickable fit">
+              <thead>
+                <tr>
+                  <th className="r">#</th>
+                  <th>Session</th>
+                  <th>Project</th>
+                  <th>Last active</th>
+                  <th className="r">Turns</th>
+                  <th className="r" title="Largest context any single turn read">
+                    Peak ctx
+                  </th>
+                  <th className="r">Per turn</th>
+                  <th className="r" title="Share of the cost spent re-reading cached context">
+                    Cache read
+                  </th>
+                  <th className="r" title="Context re-reads that batchable runs would have avoided">
+                    Batching
+                  </th>
+                  <th className="r">Cost</th>
+                </tr>
+              </thead>
+              <tbody>
+                {rows.slice(0, limit).map((s, i) => (
+                  <tr
+                    key={`${s.projectDir}/${s.id}`}
+                    onClick={() => onOpenSession(s.projectDir, s.id)}
+                    tabIndex={0}
+                    onKeyDown={(e) => e.key === "Enter" && onOpenSession(s.projectDir, s.id)}
+                  >
+                    <td className="r num muted">{String(i + 1).padStart(2, "0")}</td>
+                    <td className="ellipsis-cell strong" title={s.firstPrompt}>
+                      {s.title ?? s.firstPrompt ?? s.id}
+                    </td>
+                    <td className="muted nowrap clip" title={s.project}>
+                      {projectName(s.project)}
+                    </td>
+                    <td className="muted nowrap">{fmtDate(s.endedAt)}</td>
+                    <td className="r num">{s.stats.turns.toLocaleString()}</td>
+                    <td className="r num">{formatTokens(s.stats.peakContext)}</td>
+                    <td className="r num">{s.stats.turns ? formatUsd(s.stats.cost.total / s.stats.turns) : "–"}</td>
+                    <td className="r num">{pct(s.stats.cost.cacheRead, s.stats.cost.total)}</td>
+                    <td className="r num">{s.stats.savedCost ? formatUsd(s.stats.savedCost) : <span className="muted">–</span>}</td>
+                    <td className="r num strong nowrap">
+                      {formatUsd(s.stats.cost.total)}
+                      <span className="share-track" aria-hidden>
+                        <span className="share-bar" style={{ width: `${maxCost ? (s.stats.cost.total / maxCost) * 100 : 0}%` }} />
+                      </span>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+            {rows.length > limit && (
+              <button className="link show-more" onClick={() => setLimit(limit + 50)}>
+                Show more ({rows.length - limit} left)
+              </button>
+            )}
+            {!rows.length && <div className="empty">No sessions in this range.</div>}
+          </section>
+        </>
+      )}
+    </article>
+  );
+}
+
+function TopStat({ label, value, sub }: { label: string; value: string; sub?: string }) {
+  return (
+    <div className="stat">
+      <dt>
+        <Caption>{label}</Caption>
+      </dt>
+      <dd className="stat-value">{value}</dd>
+      {sub && <dd className="stat-sub">{sub}</dd>}
+    </div>
   );
 }

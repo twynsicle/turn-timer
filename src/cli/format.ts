@@ -1,4 +1,5 @@
 import pc from "picocolors";
+import { formatTokens, formatUsd } from "../core/cost.js";
 import { BUCKETS, formatMs, pct, type Stats } from "../core/metrics.js";
 
 const ANSI = /\x1b\[[0-9;]*m/g;
@@ -57,6 +58,38 @@ export function singlePct(single: number, total: number): string {
   return r >= 0.5 ? pc.red(s) : r >= 0.3 ? pc.yellow(s) : pc.green(s);
 }
 
+/** Where the money went: one line with each token kind's share of the cost. */
+export function costLine(st: Stats): string {
+  const c = st.cost;
+  const part = (label: string, usd: number, tokens?: number) =>
+    `${label} ${formatUsd(usd)}${tokens !== undefined ? pc.dim(` (${formatTokens(tokens)})`) : ""} ${pc.dim(pct(usd, c.total))}`;
+  const parts = [
+    part("cache read", c.cacheRead, st.tokens.cacheRead),
+    part("cache write", c.cacheWrite, st.tokens.cacheWrite),
+    part("output", c.output, st.tokens.output),
+    part("input", c.input, st.tokens.input),
+  ];
+  if (c.webSearch) parts.push(part("web search", c.webSearch));
+  return (
+    `cost: ${pc.bold(pc.yellow(formatUsd(c.total)))}  ${parts.join(pc.dim(" · "))}` +
+    pc.dim(` · peak context ${formatTokens(st.peakContext)}`) +
+    (st.unpricedTurns ? pc.yellow(` · ${st.unpricedTurns} turns on unpriced models`) : "")
+  );
+}
+
+export function modelTable(byModel: Stats["byModel"]): string {
+  const rows = Object.entries(byModel).sort((a, b) => b[1].cost - a[1].cost);
+  return table(
+    [{ header: "model", flex: true }, { header: "turns", align: "right" }, { header: "tokens", align: "right" }, { header: "cost", align: "right" }],
+    rows.map(([name, m]) => [
+      name,
+      String(m.turns),
+      formatTokens(m.tokens.input + m.tokens.cacheWrite + m.tokens.cacheRead + m.tokens.output),
+      m.priced ? formatUsd(m.cost) : pc.yellow("no price"),
+    ]),
+  );
+}
+
 export function histogram(st: Stats): string {
   const max = Math.max(1, ...st.histogram);
   const width = 30;
@@ -71,7 +104,7 @@ export function histogram(st: Stats): string {
 export function summary(st: Stats, extra: { prompts?: number; reminders?: number } = {}): string {
   const likely = st.runs.filter((r) => r.kind === "likely");
   const possibly = st.runs.filter((r) => r.kind === "possibly");
-  const sum = (rs: typeof likely, k: "savedTurns" | "savedMs") => rs.reduce((s, r) => s + r[k], 0);
+  const sum = (rs: typeof likely, k: "savedTurns" | "savedMs" | "savedCost") => rs.reduce((s, r) => s + r[k], 0);
   const lines = [
     [
       extra.prompts !== undefined ? `${pc.bold(String(extra.prompts))} prompts` : "",
@@ -84,10 +117,11 @@ export function summary(st: Stats, extra: { prompts?: number; reminders?: number
       .filter(Boolean)
       .join(pc.dim(" · ")),
     `single-call turns: ${singlePct(st.singleCallTurns, st.toolTurns)} ${pc.dim(`(${st.singleCallTurns} of ${st.toolTurns} tool turns)`)}`,
-    `batchable runs: ${pc.red(`${likely.length} likely`)} ${pc.dim(`(${sum(likely, "savedTurns")} round-trips, ~${formatMs(sum(likely, "savedMs"))})`)}` +
-      `  ${pc.yellow(`${possibly.length} possibly`)} ${pc.dim(`(${sum(possibly, "savedTurns")} round-trips, ~${formatMs(sum(possibly, "savedMs"))})`)}`,
+    `batchable runs: ${pc.red(`${likely.length} likely`)} ${pc.dim(`(${sum(likely, "savedTurns")} round-trips, ~${formatMs(sum(likely, "savedMs"))}, ~${formatUsd(sum(likely, "savedCost"))})`)}` +
+      `  ${pc.yellow(`${possibly.length} possibly`)} ${pc.dim(`(${sum(possibly, "savedTurns")} round-trips, ~${formatMs(sum(possibly, "savedMs"))}, ~${formatUsd(sum(possibly, "savedCost"))})`)}`,
     `time: model ${formatMs(st.modelMs)} · tools ${formatMs(st.toolMs)}` +
       (extra.reminders ? pc.dim(` · Claude Code sent ${extra.reminders} batching reminders`) : ""),
+    costLine(st),
   ];
   return lines.join("\n");
 }

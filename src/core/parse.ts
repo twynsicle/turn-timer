@@ -5,7 +5,8 @@ import type { Config } from "./config.js";
 import { subagentFiles } from "./discover.js";
 import { readLines, tryParse } from "./lines.js";
 import { INTERRUPT_PREFIX, blocks, isToolResultRecord, promptTextOf, toolResultText, ts, userText } from "./records.js";
-import type { AgentRef, Prompt, Session, SubagentRun, ToolCall, Turn } from "./types.js";
+import { emptyUsage } from "./cost.js";
+import type { AgentRef, Prompt, Session, SubagentRun, ToolCall, Turn, Usage } from "./types.js";
 
 /** Cap on result text kept per call for the dependency heuristic. */
 const RESULT_TEXT_CAP = 256 << 10;
@@ -66,7 +67,7 @@ function handleAssistant(rec: any, offset: number, st: StreamState, config: Conf
       toolCalls: [],
       hasText: false,
       hasThinking: false,
-      outputTokens: 0,
+      usage: emptyUsage(),
     };
     st.turnsById.set(id, turn);
     st.turnIndex.set(id, st.turns.length);
@@ -74,7 +75,7 @@ function handleAssistant(rec: any, offset: number, st: StreamState, config: Conf
   }
   const turnIdx = st.turnIndex.get(id)!;
   if (at > turn.respondedAt) turn.respondedAt = at;
-  turn.outputTokens = Math.max(turn.outputTokens, msg.usage?.output_tokens ?? 0);
+  if (msg.usage) mergeUsage(turn.usage, msg.usage);
 
   for (const b of blocks(rec)) {
     if (b?.type === "text" && b.text?.trim()) turn.hasText = true;
@@ -100,6 +101,26 @@ function handleAssistant(rec: any, offset: number, st: StreamState, config: Conf
     }
   }
   return isNew ? turn : undefined;
+}
+
+const num = (v: unknown) => (typeof v === "number" && Number.isFinite(v) ? v : 0);
+
+/**
+ * Fold one record's `usage` into the turn's. Every content block of a response is its own
+ * record and each repeats the response's usage, so take the max per field, not the sum.
+ */
+function mergeUsage(u: Usage, raw: any) {
+  const written = num(raw.cache_creation_input_tokens);
+  const oneHour = num(raw.cache_creation?.ephemeral_1h_input_tokens);
+  // Without the TTL breakdown, treat every write as the 5-minute kind.
+  const fiveMin = raw.cache_creation ? num(raw.cache_creation.ephemeral_5m_input_tokens) : written;
+  u.input = Math.max(u.input, num(raw.input_tokens));
+  u.cacheWrite5m = Math.max(u.cacheWrite5m, fiveMin);
+  u.cacheWrite1h = Math.max(u.cacheWrite1h, oneHour);
+  u.cacheRead = Math.max(u.cacheRead, num(raw.cache_read_input_tokens));
+  u.output = Math.max(u.output, num(raw.output_tokens));
+  u.webSearches = Math.max(u.webSearches, num(raw.server_tool_use?.web_search_requests));
+  if (raw.speed === "fast") u.fast = true;
 }
 
 function findReference(needles: string[], turnIdx: number, st: StreamState, lookback: number): number {

@@ -8,7 +8,7 @@ import { cacheDir } from "./paths.js";
 import type { Session } from "./types.js";
 
 /** Bump when the Session shape or parsing rules change, to invalidate old caches. */
-const CACHE_VERSION = 2;
+const CACHE_VERSION = 3;
 
 const sha1 = (s: string) => createHash("sha1").update(s).digest("hex");
 

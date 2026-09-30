@@ -534,6 +534,102 @@ tr:focus-visible {
   color: var(--muted-foreground);
 }
 
+.summary-side {
+  display: flex;
+  flex-direction: column;
+  gap: 32px;
+  min-width: 0;
+}
+
+/* ---------- cost ---------- */
+
+.cost-total {
+  font-size: var(--fs-xl);
+  line-height: 1.15;
+  font-weight: 700;
+  letter-spacing: -0.01em;
+  font-variant-numeric: tabular-nums;
+}
+.cost-bar {
+  display: flex;
+  height: 10px;
+  margin: 14px 0 10px;
+  border-radius: 2px;
+  overflow: hidden;
+  background: var(--muted);
+}
+.cost-seg {
+  display: block;
+  height: 100%;
+  min-width: 1px;
+}
+.cost-seg + .cost-seg {
+  box-shadow: inset 1px 0 0 var(--card);
+}
+.seg-cacheRead {
+  background: var(--before);
+}
+.seg-cacheWrite {
+  background: var(--suggestion);
+}
+.seg-output {
+  background: var(--praise);
+}
+.seg-input {
+  background: var(--subtle);
+}
+.seg-webSearch {
+  background: var(--risk);
+}
+.cost-rows,
+.cost-models {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.cost-models {
+  margin-top: 14px;
+  padding-top: 10px;
+  border-top: 1px solid var(--border);
+}
+.cost-row {
+  display: grid;
+  grid-template-columns: 10px minmax(0, 1fr) 64px 72px 40px;
+  gap: 10px;
+  align-items: baseline;
+  font-size: var(--fs-sm);
+}
+.cost-row.model {
+  grid-template-columns: minmax(0, 1fr) 84px 72px 40px;
+}
+.cost-row > .num {
+  text-align: right;
+}
+.cost-swatch {
+  width: 10px;
+  height: 10px;
+  border-radius: 2px;
+  align-self: center;
+}
+.cost-panel .small {
+  margin-top: 10px;
+}
+.share-track {
+  display: inline-block;
+  width: 56px;
+  height: 6px;
+  margin-left: 8px;
+  vertical-align: middle;
+  background: var(--muted);
+  border-radius: 2px;
+  overflow: hidden;
+}
+.share-bar {
+  display: block;
+  height: 100%;
+  background: var(--suggestion);
+}
+
 /* ---------- tabs & controls ---------- */
 
 .tabs {
@@ -643,7 +739,7 @@ table.grid {
 
 .prompt-row {
   display: grid;
-  grid-template-columns: 32px minmax(0, 1fr) 56px 56px 48px 60px 72px 72px 72px;
+  grid-template-columns: 32px minmax(0, 1fr) 56px 56px 48px 60px 72px 72px 72px 72px;
   gap: 12px;
   align-items: baseline;
   padding: 10px 8px 10px 0;
@@ -691,10 +787,10 @@ button.prompt-row:hover {
 
 /* ---------- turns ---------- */
 
-/* Columns: turn # | calls | steps (category | tool | input | tool time) | model time */
+/* Columns: turn # | calls | steps (category | tool | input | tool time) | model time | cost */
 .turn {
   display: grid;
-  grid-template-columns: 36px 40px minmax(0, 1fr) 80px;
+  grid-template-columns: 36px 40px minmax(0, 1fr) 80px 64px;
   gap: 12px;
   align-items: baseline;
   padding: 6px 0;
@@ -1016,4 +1112,25 @@ button.prompt-row:hover {
     font-size: var(--fs-xl);
     white-space: normal;
   }
+}
+
+.seg-inline {
+  margin: 0 0 0 auto;
+}
+.show-more {
+  margin-top: 14px;
+}
+
+/* A table that fits its container: the ellipsis column takes the leftover width. */
+.grid.fit th {
+  white-space: nowrap;
+}
+.grid.fit .ellipsis-cell {
+  max-width: 0;
+  width: 100%;
+}
+.grid.fit .clip {
+  max-width: 180px;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }

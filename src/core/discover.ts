@@ -76,6 +76,16 @@ export async function listSessions(projectDir: string, root = projectsDir()): Pr
   return out.sort((a, b) => b.mtime - a.mtime);
 }
 
+/** Sessions across every project (or just `projectDirs`), newest first. */
+export async function listAllSessions(opts: { sinceMs?: number; projectDirs?: string[] } = {}, root = projectsDir()): Promise<SessionInfo[]> {
+  const dirs = opts.projectDirs ?? (await listProjects(root)).map((p) => p.dir);
+  const out: SessionInfo[] = [];
+  for (const dir of dirs) {
+    for (const s of await listSessions(dir, root)) if (!opts.sinceMs || s.mtime >= opts.sinceMs) out.push(s);
+  }
+  return out.sort((a, b) => b.mtime - a.mtime);
+}
+
 export async function subagentFiles(sessionPath: string): Promise<string[]> {
   const dir = join(sessionPath.slice(0, -".jsonl".length), "subagents");
   if (!(await exists(dir))) return [];

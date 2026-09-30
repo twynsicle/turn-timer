@@ -3,11 +3,14 @@ import { Command } from "commander";
 import pc from "picocolors";
 import { loadSession } from "../core/cache.js";
 import type { Config } from "../core/config.js";
-import { listProjects, listSessions } from "../core/discover.js";
+import { formatTokens, formatUsd } from "../core/cost.js";
+import { listAllSessions, listProjects, listSessions } from "../core/discover.js";
 import { loadConfig } from "../core/load-config.js";
 import {
   type BatchableRun,
   type MetricOptions,
+  type Stats,
+  pct,
   formatMs,
   mergeStats,
   promptStats,
@@ -17,7 +20,7 @@ import {
 } from "../core/metrics.js";
 import { resolveProject, resolveSession } from "../core/resolve.js";
 import type { Prompt, Session, SessionInfo, Turn } from "../core/types.js";
-import { date, histogram, singlePct, size, summary, table, truncate } from "./format.js";
+import { costLine, date, histogram, modelTable, singlePct, size, summary, table, truncate } from "./format.js";
 
 interface GlobalOpts {
   json?: boolean;
@@ -28,7 +31,7 @@ interface GlobalOpts {
 
 const program = new Command()
   .name("turn-timer")
-  .description("Inspect Claude Code session logs: tool calls per turn and missed batching")
+  .description("Inspect Claude Code session logs: cost, tool calls per turn and missed batching")
   .option("--json", "output JSON")
   .option("--no-subagents", "exclude subagent turns from metrics")
   .option("--config <path>", "config file (default ./turn-timer.config.json or ~/.turn-timer.json)")
@@ -100,14 +103,7 @@ program
       const cutoff = Date.now() - parseDuration(o.since);
       sessions = sessions.filter((s) => s.mtime >= cutoff);
     }
-    const rows: { info: SessionInfo; session: Session; stats: ReturnType<typeof sessionStats> }[] = [];
-    const showProgress = !globals().json && process.stderr.isTTY;
-    for (const [i, info] of sessions.entries()) {
-      if (showProgress) process.stderr.write(`\r${pc.dim(`Parsing ${i + 1}/${sessions.length} (${size(info.size)})`)}\x1b[K`);
-      const session = await load(info);
-      rows.push({ info, session, stats: sessionStats(session, metricOpts()) });
-    }
-    if (showProgress) process.stderr.write("\r\x1b[K");
+    const rows = await loadAll(sessions);
     const total = mergeStats(rows.map((r) => r.stats));
     if (globals().json) {
       return out({ project, total: { ...total, runs: undefined }, sessions: rows.map((r) => ({ ...r.info, stats: { ...r.stats, runs: undefined } })) });
@@ -123,16 +119,72 @@ program
         [
           { header: "session" }, { header: "date" }, { header: "turns", align: "right" }, { header: "calls", align: "right" },
           { header: "avg", align: "right" }, { header: "single", align: "right" }, { header: "runs", align: "right" },
-          { header: "saved", align: "right" }, { header: "title", flex: true },
+          { header: "saved", align: "right" }, { header: "cost", align: "right" }, { header: "title", flex: true },
         ],
         rows.map(({ info, session, stats: st }) => [
           info.id.slice(0, 8), date(session.startedAt), String(st.turns), String(st.toolCalls), st.avgBatch.toFixed(1),
-          singlePct(st.singleCallTurns, st.toolTurns), runsCell(st.runs), formatMs(st.savedMs), info.title ?? info.firstPrompt ?? "",
+          singlePct(st.singleCallTurns, st.toolTurns), runsCell(st.runs), formatMs(st.savedMs), pc.yellow(formatUsd(st.cost.total)),
+          info.title ?? info.firstPrompt ?? "",
         ]),
       ),
     );
     console.log();
     console.log(toolTable(total.byTool, Number(o.top)));
+  });
+
+program
+  .command("top")
+  .description("most expensive sessions across all projects (estimated at API list prices)")
+  .option("--since <duration>", "only sessions active within this window, e.g. 7d, 12h", "30d")
+  .option("-n, --limit <n>", "sessions to show", "20")
+  .option("-p, --project <project>", "only this project")
+  .action(async (o: { since: string; limit: string; project?: string }) => {
+    const projects = await listProjects();
+    const cwdOf = new Map(projects.map((p) => [p.dir, p.cwd]));
+    const projectDirs = o.project ? [(await resolveProject(o.project)).dir] : undefined;
+    const since = Date.now() - parseDuration(o.since);
+    // mtime is never earlier than the last record, so it's a safe prefilter; the records decide.
+    const rows = (await loadAll(await listAllSessions({ sinceMs: since, projectDirs }))).filter((r) => r.session.endedAt >= since);
+    rows.sort((a, b) => b.stats.cost.total - a.stats.cost.total);
+    const total = mergeStats(rows.map((r) => r.stats));
+    const shown = rows.slice(0, Number(o.limit));
+    if (globals().json) {
+      return out({
+        total: { cost: total.cost, tokens: total.tokens, byModel: total.byModel },
+        sessions: shown.map(({ info, stats: st }) => ({ ...info, project: cwdOf.get(info.projectDir), stats: { ...st, runs: undefined } })),
+      });
+    }
+    console.log(
+      pc.bold(`${rows.length} sessions`) + pc.dim(` active in the last ${o.since}${o.project ? ` in ${cwdOf.get(projectDirs![0]!)}` : " across all projects"}`),
+    );
+    console.log(costLine(total));
+    console.log();
+    console.log(
+      table(
+        [
+          { header: "#", align: "right" }, { header: "cost", align: "right" }, { header: "share", align: "right" }, { header: "id" },
+          { header: "last active" }, { header: "project" }, { header: "turns", align: "right" }, { header: "$/turn", align: "right" },
+          { header: "peak ctx", align: "right" }, { header: "batch $", align: "right" }, { header: "title", flex: true },
+        ],
+        shown.map(({ info, session, stats: st }, i) => [
+          String(i + 1),
+          pc.bold(pc.yellow(formatUsd(st.cost.total))),
+          pct(st.cost.total, total.cost.total),
+          info.id.slice(0, 8),
+          date(session.endedAt),
+          projectLabel(cwdOf.get(info.projectDir) ?? info.projectDir),
+          String(st.turns),
+          st.turns ? formatUsd(st.cost.total / st.turns) : "",
+          formatTokens(st.peakContext),
+          st.savedCost ? formatUsd(st.savedCost) : pc.dim("–"),
+          info.title ?? info.firstPrompt ?? "",
+        ]),
+      ),
+    );
+    console.log();
+    console.log(modelTable(total.byModel));
+    console.log();
+    console.log(pc.dim("Estimated at Anthropic API list prices. Open one with `turn-timer show <id>`."));
   });
 
 program
@@ -205,6 +257,10 @@ function printSession(s: Session, o: { turns?: boolean; verbose?: boolean; only?
     console.log();
     console.log(toolTable(st.byTool, 25));
   }
+  if (Object.keys(st.byModel).length > 1) {
+    console.log();
+    console.log(modelTable(st.byModel));
+  }
 }
 
 function promptTable(prompts: Prompt[], opts: MetricOptions): string {
@@ -212,7 +268,7 @@ function promptTable(prompts: Prompt[], opts: MetricOptions): string {
     [
       { header: "#", align: "right" }, { header: "turns", align: "right" }, { header: "calls", align: "right" },
       { header: "avg", align: "right" }, { header: "single", align: "right" }, { header: "runs", align: "right" },
-      { header: "saved", align: "right" }, { header: "model", align: "right" }, { header: "prompt", flex: true },
+      { header: "saved", align: "right" }, { header: "model", align: "right" }, { header: "cost", align: "right" }, { header: "prompt", flex: true },
     ],
     prompts
       .filter((p) => p.turns.length)
@@ -222,7 +278,7 @@ function promptTable(prompts: Prompt[], opts: MetricOptions): string {
         return [
           String(p.index + 1), String(st.turns), String(st.toolCalls), st.avgBatch.toFixed(1),
           singlePct(st.singleCallTurns, st.toolTurns), runsCell(st.runs), st.savedMs ? formatMs(st.savedMs) : "",
-          formatMs(st.modelMs), flags + p.text,
+          formatMs(st.modelMs), pc.yellow(formatUsd(st.cost.total)), flags + p.text,
         ];
       }),
   );
@@ -354,6 +410,21 @@ async function withSpinner<T>(label: string, fn: () => Promise<T>): Promise<T> {
     process.stderr.write("\r\x1b[K");
   }
 }
+
+/** Parse (or load from cache) each session, with a progress line on a TTY. */
+async function loadAll(infos: SessionInfo[]) {
+  const rows: { info: SessionInfo; session: Session; stats: Stats }[] = [];
+  const showProgress = !globals().json && process.stderr.isTTY;
+  for (const [i, info] of infos.entries()) {
+    if (showProgress) process.stderr.write(`\r${pc.dim(`Parsing ${i + 1}/${infos.length} (${size(info.size)})`)}\x1b[K`);
+    const session = await load(info);
+    rows.push({ info, session, stats: sessionStats(session, metricOpts()) });
+  }
+  if (showProgress) process.stderr.write("\r\x1b[K");
+  return rows;
+}
+
+const projectLabel = (cwd: string) => cwd.split(/[\\/]/).filter(Boolean).slice(-2).join("/");
 
 function parseDuration(s: string): number {
   const m = /^(\d+(?:\.\d+)?)\s*([mhdw])$/.exec(s.trim());

@@ -1,7 +1,8 @@
 import { memo, useEffect, useMemo, useRef, useState } from "react";
 import { type BatchableRun, type Stats as StatsT, promptStats, runTotals, sessionStats, turnModelMs } from "../../src/core/metrics.js";
 import type { Prompt, Session, ToolCall, ToolCategory, Turn } from "../../src/core/types.js";
-import { Caption, type DetailTarget, Histogram, SectionRule, Stats, ToolsTable, fmtDate, formatMs, pct, singleClass } from "./common.js";
+import { contextTokens, turnCost } from "../../src/core/cost.js";
+import { Caption, CostPanel, type DetailTarget, Histogram, SectionRule, Stats, ToolsTable, fmtDate, formatMs, formatTokens, formatUsd, pct, singleClass } from "./common.js";
 
 type Tab = "prompts" | "runs" | "tools";
 
@@ -94,7 +95,10 @@ export function SessionView({
 
       <div className="summary">
         <Stats st={st} runs={runTotals(st.runs)} extra={{ prompts: session.prompts.length, reminders: session.batchingReminders }} />
-        <Histogram histogram={st.histogram} total={st.toolTurns} />
+        <div className="summary-side">
+          <CostPanel st={st} />
+          <Histogram histogram={st.histogram} total={st.toolTurns} />
+        </div>
       </div>
 
       <nav className="tabs" role="tablist">
@@ -144,6 +148,9 @@ export function SessionView({
             </span>
             <span className="r" title="Total model response time for this prompt">
               Model
+            </span>
+            <span className="r" title="Estimated cost of this prompt at API list prices, subagents included">
+              Cost
             </span>
           </div>
           {prompts.map((p) => (
@@ -202,6 +209,7 @@ const PromptBlock = memo(function PromptBlock({
         </span>
         <span className="r num">{st.savedMs ? formatMs(st.savedMs) : <span className="muted">–</span>}</span>
         <span className="r num muted">{formatMs(st.modelMs)}</span>
+        <span className="r num strong">{st.cost.total ? formatUsd(st.cost.total) : <span className="muted">–</span>}</span>
       </button>
       {open && (
         <div className="turns">
@@ -244,6 +252,9 @@ function TurnList({ turns, ctx }: { turns: Turn[]; ctx: Ctx }) {
         <span className="r" title="How long the model took to produce this turn, from the previous result arriving to the response finishing">
           Model time
         </span>
+        <span className="r" title="Estimated cost of this model response at API list prices">
+          Cost
+        </span>
       </div>
       {segments.map((seg) =>
         seg.run ? (
@@ -254,7 +265,7 @@ function TurnList({ turns, ctx }: { turns: Turn[]; ctx: Ctx }) {
               </Caption>
               <span className="run-text">
                 {seg.turns.length} single-call turns could have been 1 · saves {seg.run.savedTurns} round-trip
-                {seg.run.savedTurns === 1 ? "" : "s"}, ~{formatMs(seg.run.savedMs)}
+                {seg.run.savedTurns === 1 ? "" : "s"}, ~{formatMs(seg.run.savedMs)}, ~{formatUsd(seg.run.savedCost)}
               </span>
             </div>
             {seg.turns.map(({ t, index }) => (
@@ -298,6 +309,7 @@ function TurnRow({ t, index, ctx }: { t: Turn; index: number; ctx: Ctx }) {
     if (focused) ref.current?.scrollIntoView({ block: "center", behavior: "smooth" });
   }, [focused]);
   const n = t.toolCalls.length;
+  const cost = turnCost(t);
   return (
     <div ref={ref} className={`turn ${focused ? "focused" : ""}`}>
       <span className="turn-idx">{String(index).padStart(2, "0")}</span>
@@ -328,6 +340,9 @@ function TurnRow({ t, index, ctx }: { t: Turn; index: number; ctx: Ctx }) {
         ))}
       </ul>
       <span className="turn-model">{formatMs(turnModelMs(t))}</span>
+      <span className="turn-model" title={`${formatTokens(contextTokens(t.usage))} context · ${t.usage.output.toLocaleString()} output tokens · ${t.model}`}>
+        {cost ? formatUsd(cost.total) : "–"}
+      </span>
     </div>
   );
 }
@@ -360,6 +375,12 @@ function SubagentBlock({ call, ctx }: { call: ToolCall; ctx: Ctx }) {
               · <span className="strong bad">{st.runs.length} runs</span>
             </>
           )}
+          {st.cost.total > 0 && (
+            <>
+              {" "}
+              · <span className="strong">{formatUsd(st.cost.total)}</span>
+            </>
+          )}
         </span>
       </button>
       {open && <TurnList turns={run.turns} ctx={ctx} />}
@@ -373,7 +394,7 @@ function containsTurn(turns: Turn[], id: string): boolean {
 
 function RunsList({ runs, session, onJump }: { runs: BatchableRun[]; session: Session; onJump: (r: BatchableRun) => void }) {
   const [kind, setKind] = useState<"all" | "likely" | "possibly">("all");
-  const sorted = runs.filter((r) => kind === "all" || r.kind === kind).sort((a, b) => b.savedTurns - a.savedTurns || b.savedMs - a.savedMs);
+  const sorted = runs.filter((r) => kind === "all" || r.kind === kind).sort((a, b) => b.savedCost - a.savedCost || b.savedTurns - a.savedTurns);
   if (!runs.length) return <div className="empty">No batchable runs found.</div>;
   return (
     <div>
@@ -381,7 +402,7 @@ function RunsList({ runs, session, onJump }: { runs: BatchableRun[]; session: Se
         A run is a streak of turns that each made a single tool call, where no call depended on an earlier one's output.{" "}
         <b className="bad">Likely</b> runs are all read-only: Read, Grep, Glob and read-only shell commands. <b className="warn">Possibly</b> runs
         include edits to different files. Time saved is each extra turn's overhead: its latency minus the time spent generating output, which a
-        batched turn would still need.
+        batched turn would still need. Cost saved is each extra turn's context re-read (uncached input plus cache reads).
       </p>
       <div className="seg">
         {(["all", "likely", "possibly"] as const).map((k) => (
@@ -399,6 +420,7 @@ function RunsList({ runs, session, onJump }: { runs: BatchableRun[]; session: Se
             <th>Tools</th>
             <th className="r">Turns</th>
             <th className="r">Time saved</th>
+            <th className="r">Cost saved</th>
           </tr>
         </thead>
         <tbody>
@@ -414,6 +436,7 @@ function RunsList({ runs, session, onJump }: { runs: BatchableRun[]; session: Se
               <td className="mono">{compress(r.tools)}</td>
               <td className="r num">{r.turnIds.length}</td>
               <td className="r num">{formatMs(r.savedMs)}</td>
+              <td className="r num">{formatUsd(r.savedCost)}</td>
             </tr>
           ))}
         </tbody>
