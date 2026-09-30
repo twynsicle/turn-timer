@@ -10,13 +10,13 @@ export function projectsDir(): string {
 }
 
 export function cacheDir(): string {
-  if (process.env.TURN_TIMER_CACHE_DIR) return process.env.TURN_TIMER_CACHE_DIR;
+  if (process.env.CLAUDE_SESSIONS_CACHE_DIR) return process.env.CLAUDE_SESSIONS_CACHE_DIR;
   const p = platform();
   if (p === "win32") {
-    return join(process.env.LOCALAPPDATA || join(homedir(), "AppData", "Local"), "turn-timer", "cache");
+    return join(process.env.LOCALAPPDATA || join(homedir(), "AppData", "Local"), "claude-session-viewer", "cache");
   }
-  if (p === "darwin") return join(homedir(), "Library", "Caches", "turn-timer");
-  return join(process.env.XDG_CACHE_HOME || join(homedir(), ".cache"), "turn-timer");
+  if (p === "darwin") return join(homedir(), "Library", "Caches", "claude-session-viewer");
+  return join(process.env.XDG_CACHE_HOME || join(homedir(), ".cache"), "claude-session-viewer");
 }
 
 /**

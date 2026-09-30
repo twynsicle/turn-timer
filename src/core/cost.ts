@@ -52,12 +52,17 @@ export const PRICING: Record<string, ModelPrice> = {
  * An unknown version (claude-opus-4-9) is not matched to a sibling; it returns undefined.
  */
 export function priceOf(model: string): ModelPrice | undefined {
-  const id = model
+  return PRICING[normalizeModel(model)];
+}
+
+/** A model id without provider prefixes, date or version suffixes and "[1m]"-style tags. */
+export function normalizeModel(model: string): string {
+  return model
     .replace(/^.*?(?=claude-)/, "")
     .replace(/\[[^\]]*\]$/, "")
     .replace(/@.*$/, "")
-    .replace(/-v\d+(:\d+)?$/, "");
-  return PRICING[id] ?? PRICING[id.replace(/-\d{8}$/, "")];
+    .replace(/-v\d+(:\d+)?$/, "")
+    .replace(/-\d{8}$/, "");
 }
 
 export interface Tokens {
@@ -103,13 +108,16 @@ export function turnCost(t: Turn): Cost | undefined {
 }
 
 /**
- * What a turn cost just for existing as a separate round-trip: re-reading the context.
- * If it had been batched into the previous turn, its output and the cache writes for the
- * tool results would still be paid; the context re-read would not.
+ * What it cost to write `tokens` to the cache instead of reading them: the turn's write rate
+ * (its own 5-minute / 1-hour mix) minus the read rate. The price of a cache miss.
  */
-export function roundTripCost(t: Turn): number {
-  const c = turnCost(t);
-  return c ? c.input + c.cacheRead : 0;
+export function rebuildCost(t: Turn, tokens: number): number {
+  const price = priceOf(t.model);
+  if (!price) return 0;
+  const u = t.usage;
+  const written = u.cacheWrite5m + u.cacheWrite1h;
+  const writeMult = written ? (u.cacheWrite5m * CACHE_WRITE_5M + u.cacheWrite1h * CACHE_WRITE_1H) / written : CACHE_WRITE_5M;
+  return (tokens * (price.input * writeMult - price.cacheRead) * (u.fast ? FAST_MULTIPLIER : 1)) / 1e6;
 }
 
 export function addCost(a: Cost, b: Cost): void {

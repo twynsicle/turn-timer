@@ -5,6 +5,9 @@ import type { PromptKind } from "./types.js";
 
 export const INTERRUPT_PREFIX = "[Request interrupted by user";
 
+/** Prompts are kept whole up to this length. */
+export const PROMPT_CAP = 20_000;
+
 export function ts(rec: any): number {
   const t = rec?.timestamp ? Date.parse(rec.timestamp) : NaN;
   return Number.isFinite(t) ? t : 0;
@@ -18,9 +21,9 @@ export function blocks(rec: any): any[] {
   return [];
 }
 
-export function isToolResultRecord(rec: any): boolean {
-  const b = blocks(rec);
-  return b.length > 0 && b.every((x) => x?.type === "tool_result");
+/** A user record carrying tool results. It may also carry text (an interrupt note, a queued message). */
+export function hasToolResults(rec: any): boolean {
+  return blocks(rec).some((x) => x?.type === "tool_result");
 }
 
 /** Plain text of a user record (text blocks only). */
@@ -38,7 +41,11 @@ export function userText(rec: any): string {
 export function promptTextOf(rec: any): { text: string; kind: PromptKind } | undefined {
   if (rec?.isMeta || rec?.isCompactSummary) return undefined;
   const text = userText(rec).trim();
-  if (!text || text.startsWith(INTERRUPT_PREFIX)) return undefined;
+  if (!text) {
+    // A pasted image with no message is still a prompt.
+    return blocks(rec).some((b) => b?.type === "image") ? { text: "[image]", kind: "user" } : undefined;
+  }
+  if (text.startsWith(INTERRUPT_PREFIX)) return undefined;
   if (text.startsWith("<local-command-")) return undefined;
   if (text.startsWith("<task-notification>")) {
     const summary = /<summary>([\s\S]*?)<\/summary>/.exec(text)?.[1];
@@ -49,10 +56,10 @@ export function promptTextOf(rec: any): { text: string; kind: PromptKind } | und
     const args = /<command-args>([\s\S]*?)<\/command-args>/.exec(text)?.[1]?.trim();
     return { text: oneLine(args ? `${cmd.trim()} ${args}` : cmd.trim(), 300), kind: "command" };
   }
-  return { text: oneLine(text, 300), kind: "user" };
+  return { text: text.length > PROMPT_CAP ? `${text.slice(0, PROMPT_CAP)}…` : text, kind: "user" };
 }
 
-/** Text of a tool_result block's content, for the dependency heuristic. */
+/** Text of a tool_result block's content. */
 export function toolResultText(block: any): string {
   const c = block?.content;
   if (typeof c === "string") return c;

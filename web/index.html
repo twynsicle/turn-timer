@@ -3,11 +3,13 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>turn-timer</title>
-    <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><rect x='1' y='9' width='3' height='6' fill='%23e5484d'/><rect x='6' y='5' width='3' height='10' fill='%2330a46c'/><rect x='11' y='1' width='3' height='14' fill='%2330a46c'/></svg>" />
+    <title>Claude Session Viewer</title>
+    <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><rect x='1' y='9' width='3' height='6' fill='%232a78d6'/><rect x='6' y='5' width='3' height='10' fill='%23eb6834'/><rect x='11' y='1' width='3' height='14' fill='%231baf7a'/></svg>" />
   </head>
   <body>
     <div id="root"></div>
+    <!-- Filled by the CLI with the ReportIndex (src/core/report-data.ts). -->
+    <script id="session-index" type="application/json"></script>
     <script type="module" src="/src/main.tsx"></script>
   </body>
 </html>

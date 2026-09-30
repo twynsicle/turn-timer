@@ -1,38 +1,7 @@
-// Metrics over the session model. Pure (no Node imports) — shared with the web viewer.
+// Metrics over the session model. Pure (no Node imports) — shared with the report.
 
-import { type Cost, type Tokens, addCost, addTokens, contextTokens, roundTripCost, turnCost, usageTokens, zeroCost, zeroTokens } from "./cost.js";
-import type { AgentRef, Prompt, Session, ToolCall, Turn } from "./types.js";
-
-export interface MetricOptions {
-  /** Include subagent turns (default true). */
-  subagents?: boolean;
-}
-
-export const BUCKETS = ["1", "2", "3", "4-5", "6-10", "11+"] as const;
-
-export function bucketOf(n: number): number {
-  if (n <= 3) return n - 1;
-  if (n <= 5) return 3;
-  if (n <= 10) return 4;
-  return 5;
-}
-
-export type RunKind = "likely" | "possibly";
-
-export interface BatchableRun {
-  kind: RunKind;
-  agent: AgentRef;
-  promptIndex: number;
-  /** Message ids of the turns in the run, in order. */
-  turnIds: string[];
-  tools: string[];
-  /** Round-trips that batching would have saved (run length - 1). */
-  savedTurns: number;
-  /** Round-trip overhead of the turns after the first — the time batching would have saved. */
-  savedMs: number;
-  /** Context re-read cost of the turns after the first — the money batching would have saved. */
-  savedCost: number;
-}
+import { type Cost, type Tokens, addCost, addTokens, contextTokens, rebuildCost, turnCost, usageTokens, zeroCost, zeroTokens } from "./cost.js";
+import type { AgentRef, Prompt, Session, SubagentRun, ToolCall, Turn } from "./types.js";
 
 export interface ModelStat {
   turns: number;
@@ -44,29 +13,60 @@ export interface ModelStat {
 
 export interface ToolStat {
   calls: number;
-  /** Turns where this tool was the only call. */
-  soloTurns: number;
+  errors: number;
+  /** Sum of the calls' run times. */
+  totalMs: number;
+  maxMs: number;
 }
+
+/**
+ * Why a turn had to rewrite context that the previous turn had cached:
+ * - expired: longer than the cache TTL since the previous request started
+ * - model-switch: the cache belongs to one model; a new model starts cold
+ * - invalidated: within the TTL on the same model; something earlier in the prompt changed
+ */
+export type MissKind = "expired" | "model-switch" | "invalidated";
+
+export interface CacheMiss {
+  kind: MissKind;
+  messageId: string;
+  promptIndex: number;
+  agent: AgentRef;
+  /** From the previous request's start to this one's. */
+  gapMs: number;
+  /** The cache TTL in effect, from the stream's latest cache write (5 minutes when unknown). */
+  ttlMs: number;
+  /** Tokens that were cached before and had to be written again. */
+  rebuiltTokens: number;
+  /** Extra cost over reading them from the cache. */
+  cost: number;
+  model: string;
+  prevModel: string;
+}
+
+export interface SlowCall {
+  id: string;
+  name: string;
+  summary: string;
+  ms: number;
+  promptIndex: number;
+  /** Set for calls a subagent made. */
+  agentType?: string;
+  isError: boolean;
+}
+
+export type Ttl = "5m" | "1h" | "mixed" | "none";
 
 export interface Stats {
   turns: number;
-  /** Turns containing at least one tool call. */
-  toolTurns: number;
   toolCalls: number;
-  singleCallTurns: number;
-  histogram: number[];
-  maxBatch: number;
-  avgBatch: number;
-  medianBatch: number;
-  /** Sum of model response time across turns. */
+  subagents: number;
+  /** Main-thread model response time. */
   modelMs: number;
-  /** Sum of tool execution spans across turns. */
+  /** Main-thread tool time. Subagents run inside the Agent call that started them. */
   toolMs: number;
-  runs: BatchableRun[];
-  savedTurns: number;
-  savedMs: number;
-  savedCost: number;
-  byTool: Record<string, ToolStat>;
+  /** Time Claude spent working on prompts: prompt to last activity, idle time excluded. */
+  activeMs: number;
   tokens: Tokens;
   /** Estimated cost at API list prices; excludes turns whose model has no known price. */
   cost: Cost;
@@ -75,24 +75,22 @@ export interface Stats {
   /** Largest context (input + cache read + cache write) any single turn read. */
   peakContext: number;
   byModel: Record<string, ModelStat>;
+  misses: CacheMiss[];
+  missCost: number;
+  /** Cache TTL of the main thread's writes. */
+  ttl: Ttl;
+  byTool: Record<string, ToolStat>;
+  /** The slowest tool calls, slowest first. */
+  slowest: SlowCall[];
 }
+
+export const SLOWEST_KEPT = 25;
 
 export const turnModelMs = (t: Turn) => Math.max(0, t.respondedAt - t.requestedAt);
 
-/**
- * Output generation speed used to split a turn's latency into generation time and fixed
- * round-trip overhead. Calibrated from real Opus sessions (median ~12.6ms per output
- * token, thinking included); rounded up so savings estimates stay conservative.
- */
-export const MS_PER_OUTPUT_TOKEN = 13;
+export const callMs = (c: ToolCall) => (c.finishedAt ? Math.max(0, c.finishedAt - c.startedAt) : 0);
 
-/**
- * Latency a turn spent on things other than generating output: request overhead, prompt
- * processing, time to first token. This is what batching saves — a batched turn still has
- * to generate the same thinking and tool inputs.
- */
-export const turnOverheadMs = (t: Turn) => Math.max(0, turnModelMs(t) - t.usage.output * MS_PER_OUTPUT_TOKEN);
-
+/** Wall time the turn's tools ran for (parallel calls overlap). */
 export function turnToolMs(t: Turn): number {
   let start = Infinity;
   let end = 0;
@@ -103,234 +101,289 @@ export function turnToolMs(t: Turn): number {
   return end > start ? end - start : 0;
 }
 
-/** Turn sequences per agent: the main thread first, then each subagent (depth-first). */
-export function agentStreams(turns: Turn[], opts: MetricOptions = {}): Turn[][] {
-  const out: Turn[][] = [turns];
-  if (opts.subagents === false) return out;
-  const visit = (ts: Turn[]) => {
-    for (const t of ts) {
-      for (const c of t.toolCalls) {
-        if (c.subagent) {
-          out.push(c.subagent.turns);
-          visit(c.subagent.turns);
-        }
-      }
+export interface Stream {
+  turns: Turn[];
+  promptIndex: number;
+  main: boolean;
+}
+
+function subagentStreams(turns: Turn[], promptIndex: number, out: Stream[]) {
+  for (const t of turns) {
+    for (const c of t.toolCalls) {
+      if (!c.subagent) continue;
+      out.push({ turns: c.subagent.turns, promptIndex, main: false });
+      subagentStreams(c.subagent.turns, promptIndex, out);
     }
-  };
-  visit(turns);
+  }
+}
+
+/** The prompt's main thread, then every subagent under it (depth-first), then detached runs. */
+export function promptStreams(p: Prompt): Stream[] {
+  const out: Stream[] = [{ turns: p.turns, promptIndex: p.index, main: true }];
+  subagentStreams(p.turns, p.index, out);
+  for (const r of p.detached ?? []) out.push(...runStreams(r, p.index));
   return out;
 }
 
-export function promptStreams(p: Prompt, opts: MetricOptions = {}): Turn[][] {
-  return agentStreams(p.turns, opts);
+export function runStreams(run: SubagentRun, promptIndex: number): Stream[] {
+  const out: Stream[] = [{ turns: run.turns, promptIndex, main: false }];
+  subagentStreams(run.turns, promptIndex, out);
+  return out;
 }
 
-const isBatchable = (c: ToolCall) => c.readOnly || c.category === "edit";
-
-/**
- * Find runs of consecutive single-call turns within one agent stream that could have
- * been a single batched turn.
- *
- * A run extends while each next call is read-only or an edit, doesn't touch a path
- * already touched in the run, and doesn't reference a result produced inside the run.
- * Runs of only read-only calls are "likely"; runs that include edits are "possibly".
- */
-export function findRuns(turns: Turn[], promptIndex: number): BatchableRun[] {
-  const runs: BatchableRun[] = [];
-  let run: Turn[] = [];
-  let paths = new Set<string>();
-
-  const close = () => {
-    if (run.length >= 2) {
-      const calls = run.map((t) => t.toolCalls[0]!);
-      runs.push({
-        kind: calls.every((c) => c.readOnly) ? "likely" : "possibly",
-        agent: run[0]!.agent,
-        promptIndex,
-        turnIds: run.map((t) => t.messageId),
-        tools: calls.map((c) => c.name),
-        savedTurns: run.length - 1,
-        savedMs: run.slice(1).reduce((s, t) => s + turnOverheadMs(t), 0),
-        savedCost: run.slice(1).reduce((s, t) => s + roundTripCost(t), 0),
-      });
-    }
-    run = [];
-    paths = new Set();
-  };
-  const start = (t: Turn) => {
-    run = [t];
-    paths = new Set(t.toolCalls[0]!.paths);
-  };
-
-  for (const t of turns) {
-    const c = t.toolCalls.length === 1 ? t.toolCalls[0]! : undefined;
-    if (!c || !isBatchable(c) || c.denied) {
-      close();
-      continue;
-    }
-    if (!run.length) {
-      start(t);
-      continue;
-    }
-    const dependsOnRun = c.refsBack > 0 && c.refsBack <= run.length;
-    const overlaps = c.paths.some((p) => paths.has(p));
-    if (dependsOnRun || overlaps) {
-      close();
-      start(t);
-      continue;
-    }
-    run.push(t);
-    for (const p of c.paths) paths.add(p);
-  }
-  close();
-  return runs;
-}
-
-/** Stats over a set of agent streams (runs are detected per stream). */
-export function computeStats(streams: { turns: Turn[]; promptIndex: number }[]): Stats {
-  const batches: number[] = [];
-  const histogram = BUCKETS.map(() => 0);
-  const byTool: Record<string, ToolStat> = {};
-  let turns = 0;
-  let toolCalls = 0;
-  let modelMs = 0;
-  let toolMs = 0;
-  const runs: BatchableRun[] = [];
-  const tokens = zeroTokens();
-  const cost = zeroCost();
-  let unpricedTurns = 0;
-  let peakContext = 0;
-  const byModel: Record<string, ModelStat> = {};
-
+function lastActivity(streams: Stream[], from: number): number {
+  let end = from;
   for (const s of streams) {
     for (const t of s.turns) {
-      turns++;
-      modelMs += turnModelMs(t);
-      const tt = usageTokens(t.usage);
-      addTokens(tokens, tt);
-      peakContext = Math.max(peakContext, contextTokens(t.usage));
-      const c = turnCost(t);
-      if (c) addCost(cost, c);
-      else unpricedTurns++;
-      const ms = (byModel[t.model || "unknown"] ??= { turns: 0, tokens: zeroTokens(), cost: 0, priced: !!c });
-      ms.turns++;
-      addTokens(ms.tokens, tt);
-      ms.cost += c?.total ?? 0;
-      const n = t.toolCalls.length;
-      if (!n) continue;
-      toolMs += turnToolMs(t);
-      batches.push(n);
-      toolCalls += n;
-      histogram[bucketOf(n)]!++;
-      for (const c of t.toolCalls) {
-        const ts = (byTool[c.name] ??= { calls: 0, soloTurns: 0 });
-        ts.calls++;
-        if (n === 1) ts.soloTurns++;
+      end = Math.max(end, t.respondedAt);
+      for (const c of t.toolCalls) if (c.finishedAt) end = Math.max(end, c.finishedAt);
+    }
+  }
+  return end;
+}
+
+/** When the prompt's last activity ended, in any stream. */
+export const promptEnd = (p: Prompt) => lastActivity(promptStreams(p), p.startedAt);
+
+/** How long a subagent ran: its first request to its (or its children's) last activity. */
+export function runSpanMs(run: SubagentRun): number {
+  const start = run.turns[0]?.requestedAt;
+  return start ? lastActivity(runStreams(run, -1), start) - start : 0;
+}
+
+export const promptActiveMs = (p: Prompt) => (p.turns.length || p.detached?.length ? promptEnd(p) - p.startedAt : 0);
+
+const FIVE_MINUTES = 5 * 60_000;
+const ONE_HOUR = 60 * 60_000;
+/** Rebuilds smaller than this aren't worth reporting. */
+const MIN_MISS_TOKENS = 5000;
+
+/**
+ * Turns that rewrote context the previous turn in the same stream had cached. The main thread
+ * is scanned across prompts, since the usual miss is the first turn after you've been away.
+ *
+ * A miss: this turn read less than 80% of the previous turn's context from the cache, lost at
+ * least MIN_MISS_TOKENS, and wrote back at least half of what it lost. The last condition
+ * separates a rebuild from compaction, where the context shrinks instead.
+ */
+export function findCacheMisses(s: Session): CacheMiss[] {
+  const out: CacheMiss[] = [];
+  scanStream(s.prompts.flatMap((p) => p.turns.map((t) => ({ t, promptIndex: p.index }))), out);
+  for (const p of s.prompts) {
+    for (const st of promptStreams(p).slice(1)) scanStream(st.turns.map((t) => ({ t, promptIndex: p.index })), out);
+  }
+  return out;
+}
+
+function scanStream(items: { t: Turn; promptIndex: number }[], out: CacheMiss[]) {
+  let ttlMs = 0;
+  for (let i = 0; i < items.length; i++) {
+    const { t, promptIndex } = items[i]!;
+    const prev = items[i - 1]?.t;
+    if (prev) {
+      const expected = contextTokens(prev.usage);
+      const lost = expected - t.usage.cacheRead;
+      const rewritten = t.usage.input + t.usage.cacheWrite5m + t.usage.cacheWrite1h;
+      if (lost >= MIN_MISS_TOKENS && t.usage.cacheRead < expected * 0.8 && rewritten >= lost * 0.5) {
+        const rebuilt = Math.min(lost, rewritten);
+        const gapMs = Math.max(0, t.requestedAt - prev.requestedAt);
+        const ttl = ttlMs || FIVE_MINUTES;
+        out.push({
+          kind: t.model !== prev.model ? "model-switch" : gapMs > ttl ? "expired" : "invalidated",
+          messageId: t.messageId,
+          promptIndex,
+          agent: t.agent,
+          gapMs,
+          ttlMs: ttl,
+          rebuiltTokens: rebuilt,
+          cost: rebuildCost(t, rebuilt),
+          model: t.model,
+          prevModel: prev.model,
+        });
       }
     }
-    runs.push(...findRuns(s.turns, s.promptIndex));
+    if (t.usage.cacheWrite1h > 0) ttlMs = ONE_HOUR;
+    else if (t.usage.cacheWrite5m > 0) ttlMs = FIVE_MINUTES;
   }
-  batches.sort((a, b) => a - b);
-  return {
-    turns,
-    toolTurns: batches.length,
-    toolCalls,
-    singleCallTurns: histogram[0]!,
-    histogram,
-    maxBatch: batches.at(-1) ?? 0,
-    avgBatch: batches.length ? toolCalls / batches.length : 0,
-    medianBatch: batches.length ? batches[Math.floor(batches.length / 2)]! : 0,
-    modelMs,
-    toolMs,
-    runs,
-    savedTurns: runs.reduce((s, r) => s + r.savedTurns, 0),
-    savedMs: runs.reduce((s, r) => s + r.savedMs, 0),
-    savedCost: runs.reduce((s, r) => s + r.savedCost, 0),
-    byTool,
-    tokens,
-    cost,
-    unpricedTurns,
-    peakContext,
-    byModel,
-  };
 }
 
-export function promptStats(p: Prompt, opts: MetricOptions = {}): Stats {
-  return computeStats(promptStreams(p, opts).map((turns) => ({ turns, promptIndex: p.index })));
-}
+class StatsBuilder {
+  turns = 0;
+  toolCalls = 0;
+  subagents = 0;
+  modelMs = 0;
+  toolMs = 0;
+  activeMs = 0;
+  tokens = zeroTokens();
+  cost = zeroCost();
+  unpricedTurns = 0;
+  peakContext = 0;
+  byModel: Record<string, ModelStat> = {};
+  misses: CacheMiss[] = [];
+  byTool: Record<string, ToolStat> = {};
+  slowest: SlowCall[] = [];
+  ttl5m = false;
+  ttl1h = false;
 
-export function sessionStats(s: Session, opts: MetricOptions = {}): Stats {
-  return computeStats(
-    s.prompts.flatMap((p) => promptStreams(p, opts).map((turns) => ({ turns, promptIndex: p.index }))),
-  );
-}
+  addStream(s: Stream) {
+    if (!s.main) this.subagents++;
+    for (const t of s.turns) this.addTurn(t, s);
+  }
 
-/** Combine already-computed stats (e.g. across sessions of a project). */
-export function mergeStats(parts: Stats[]): Stats {
-  const histogram = BUCKETS.map((_, i) => parts.reduce((s, p) => s + p.histogram[i]!, 0));
-  const byTool: Record<string, ToolStat> = {};
-  for (const p of parts) {
-    for (const [name, t] of Object.entries(p.byTool)) {
-      const acc = (byTool[name] ??= { calls: 0, soloTurns: 0 });
-      acc.calls += t.calls;
-      acc.soloTurns += t.soloTurns;
+  private addTurn(t: Turn, s: Stream) {
+    this.turns++;
+    const tt = usageTokens(t.usage);
+    addTokens(this.tokens, tt);
+    this.peakContext = Math.max(this.peakContext, contextTokens(t.usage));
+    const c = turnCost(t);
+    if (c) addCost(this.cost, c);
+    else this.unpricedTurns++;
+    const ms = (this.byModel[t.model || "unknown"] ??= { turns: 0, tokens: zeroTokens(), cost: 0, priced: !!c });
+    ms.turns++;
+    addTokens(ms.tokens, tt);
+    ms.cost += c?.total ?? 0;
+    if (s.main) {
+      this.modelMs += turnModelMs(t);
+      this.toolMs += turnToolMs(t);
+      if (t.usage.cacheWrite1h > 0) this.ttl1h = true;
+      else if (t.usage.cacheWrite5m > 0) this.ttl5m = true;
+    }
+    for (const call of t.toolCalls) {
+      this.toolCalls++;
+      const d = callMs(call);
+      const ts = (this.byTool[call.name] ??= { calls: 0, errors: 0, totalMs: 0, maxMs: 0 });
+      ts.calls++;
+      if (call.isError) ts.errors++;
+      ts.totalMs += d;
+      ts.maxMs = Math.max(ts.maxMs, d);
+      if (d > 0) this.considerSlow(call, d, t, s.promptIndex);
     }
   }
-  const tokens = zeroTokens();
-  const cost = zeroCost();
-  const byModel: Record<string, ModelStat> = {};
-  for (const p of parts) {
-    addTokens(tokens, p.tokens);
-    addCost(cost, p.cost);
-    for (const [name, m] of Object.entries(p.byModel)) {
-      const acc = (byModel[name] ??= { turns: 0, tokens: zeroTokens(), cost: 0, priced: m.priced });
-      acc.turns += m.turns;
-      addTokens(acc.tokens, m.tokens);
-      acc.cost += m.cost;
-    }
+
+  private considerSlow(c: ToolCall, ms: number, t: Turn, promptIndex: number) {
+    const list = this.slowest;
+    if (list.length >= SLOWEST_KEPT && ms <= list.at(-1)!.ms) return;
+    list.push({
+      id: c.id,
+      name: c.name,
+      summary: c.summary,
+      ms,
+      promptIndex,
+      agentType: t.agent.kind === "subagent" ? t.agent.agentType : undefined,
+      isError: c.isError,
+    });
+    list.sort((a, b) => b.ms - a.ms);
+    if (list.length > SLOWEST_KEPT) list.pop();
   }
-  const sum = (k: "turns" | "toolTurns" | "toolCalls" | "modelMs" | "toolMs" | "savedTurns" | "savedMs" | "savedCost" | "unpricedTurns") =>
-    parts.reduce((s, p) => s + p[k], 0);
-  const toolTurns = sum("toolTurns");
-  const toolCalls = sum("toolCalls");
-  // Median from the histogram is approximate across parts; use the bucket's lower bound.
-  let median = 0;
-  let seen = 0;
-  const lower = [1, 2, 3, 4, 6, 11];
-  for (let i = 0; i < histogram.length; i++) {
-    seen += histogram[i]!;
-    if (seen > toolTurns / 2) {
-      median = lower[i]!;
-      break;
-    }
+
+  build(): Stats {
+    return {
+      turns: this.turns,
+      toolCalls: this.toolCalls,
+      subagents: this.subagents,
+      modelMs: this.modelMs,
+      toolMs: this.toolMs,
+      activeMs: this.activeMs,
+      tokens: this.tokens,
+      cost: this.cost,
+      unpricedTurns: this.unpricedTurns,
+      peakContext: this.peakContext,
+      byModel: this.byModel,
+      misses: this.misses,
+      missCost: this.misses.reduce((sum, m) => sum + m.cost, 0),
+      ttl: this.ttl1h && this.ttl5m ? "mixed" : this.ttl1h ? "1h" : this.ttl5m ? "5m" : "none",
+      byTool: this.byTool,
+      slowest: this.slowest,
+    };
   }
-  return {
-    turns: sum("turns"),
-    toolTurns,
-    toolCalls,
-    singleCallTurns: histogram[0]!,
-    histogram,
-    maxBatch: Math.max(0, ...parts.map((p) => p.maxBatch)),
-    avgBatch: toolTurns ? toolCalls / toolTurns : 0,
-    medianBatch: median,
-    modelMs: sum("modelMs"),
-    toolMs: sum("toolMs"),
-    runs: parts.flatMap((p) => p.runs),
-    savedTurns: sum("savedTurns"),
-    savedMs: sum("savedMs"),
-    savedCost: sum("savedCost"),
-    byTool,
-    tokens,
-    cost,
-    unpricedTurns: sum("unpricedTurns"),
-    peakContext: Math.max(0, ...parts.map((p) => p.peakContext)),
-    byModel,
-  };
 }
 
-/** Every turn in the prompt, main thread plus (optionally) subagents, in stream order. */
-export function allTurns(p: Prompt, opts: MetricOptions = {}): Turn[] {
-  return promptStreams(p, opts).flat();
+export interface SessionAnalysis {
+  total: Stats;
+  /** One per prompt, by prompt index. */
+  prompts: Stats[];
+  /** Cache misses by the message id of the turn that rebuilt the cache. */
+  missByTurn: Map<string, CacheMiss>;
+}
+
+export function analyzeSession(s: Session): SessionAnalysis {
+  const misses = findCacheMisses(s);
+  const missByTurn = new Map(misses.map((m) => [m.messageId, m]));
+  const total = new StatsBuilder();
+  total.misses = misses;
+  const spans: [number, number][] = [];
+  const prompts = s.prompts.map((p) => {
+    const b = new StatsBuilder();
+    b.activeMs = promptActiveMs(p);
+    b.misses = misses.filter((m) => m.promptIndex === p.index);
+    for (const st of promptStreams(p)) {
+      b.addStream(st);
+      total.addStream(st);
+    }
+    if (b.activeMs) spans.push([p.startedAt, p.startedAt + b.activeMs]);
+    return b.build();
+  });
+  // A background subagent can keep a prompt running into the next one: count that time once.
+  total.activeMs = unionMs(spans);
+  return { total: total.build(), prompts, missByTurn };
+}
+
+/** Total length of a set of time ranges, overlaps counted once. */
+function unionMs(spans: [number, number][]): number {
+  let sum = 0;
+  let end = -Infinity;
+  for (const [a, b] of [...spans].sort((x, y) => x[0] - y[0])) {
+    if (b <= end) continue;
+    sum += b - Math.max(a, end);
+    end = b;
+  }
+  return sum;
+}
+
+/** Stats for one subagent run and everything it spawned. */
+export function runStats(run: SubagentRun, missByTurn: Map<string, CacheMiss>): Stats {
+  const b = new StatsBuilder();
+  for (const st of runStreams(run, -1)) {
+    b.addStream(st);
+    for (const t of st.turns) {
+      const m = missByTurn.get(t.messageId);
+      if (m) b.misses.push(m);
+    }
+  }
+  return b.build();
+}
+
+/** Cost per model on each day: `{ "2026-09-29": { "claude-opus-5": 12.5 } }`. */
+export type DailyCost = Record<string, Record<string, number>>;
+
+/** The local calendar day, as "2026-09-29". */
+export function dayKey(ms: number): string {
+  const d = new Date(ms);
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+}
+
+/** Each turn's cost on the day it was requested, subagents included. */
+export function costByDay(s: Session): DailyCost {
+  const out: DailyCost = {};
+  for (const p of s.prompts) {
+    for (const stream of promptStreams(p)) {
+      for (const t of stream.turns) {
+        const c = turnCost(t)?.total;
+        if (!c) continue;
+        const day = (out[dayKey(t.requestedAt || t.respondedAt)] ??= {});
+        day[t.model || "unknown"] = (day[t.model || "unknown"] ?? 0) + c;
+      }
+    }
+  }
+  return out;
+}
+
+export function addDaily(into: DailyCost, from: DailyCost): DailyCost {
+  for (const [day, models] of Object.entries(from)) {
+    const d = (into[day] ??= {});
+    for (const [m, c] of Object.entries(models)) d[m] = (d[m] ?? 0) + c;
+  }
+  return into;
 }
 
 export function formatMs(ms: number): string {
@@ -338,29 +391,11 @@ export function formatMs(ms: number): string {
   if (ms < 59_950) return `${(ms / 1000).toFixed(1)}s`;
   const secs = Math.round(ms / 1000);
   const m = Math.floor(secs / 60);
-  if (m < 60) return `${m}m${String(secs % 60).padStart(2, "0")}s`;
+  if (m < 60) return `${m}m ${String(secs % 60).padStart(2, "0")}s`;
   const mins = Math.round(secs / 60);
-  return `${Math.floor(mins / 60)}h${String(mins % 60).padStart(2, "0")}m`;
+  return `${Math.floor(mins / 60)}h ${String(mins % 60).padStart(2, "0")}m`;
 }
 
 export function pct(n: number, d: number): string {
   return d ? `${Math.round((n / d) * 100)}%` : "–";
-}
-
-export interface RunTotals {
-  likely: { runs: number; turns: number; ms: number; cost: number };
-  possibly: { runs: number; turns: number; ms: number; cost: number };
-}
-
-export function runTotals(runs: BatchableRun[]): RunTotals {
-  const t = (k: RunKind) => {
-    const rs = runs.filter((r) => r.kind === k);
-    return {
-      runs: rs.length,
-      turns: rs.reduce((s, r) => s + r.savedTurns, 0),
-      ms: rs.reduce((s, r) => s + r.savedMs, 0),
-      cost: rs.reduce((s, r) => s + r.savedCost, 0),
-    };
-  };
-  return { likely: t("likely"), possibly: t("possibly") };
 }

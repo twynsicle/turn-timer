@@ -1,4 +1,4 @@
-// Shared data model. Pure types only — imported by the CLI, server and web viewer.
+// Shared data model. Pure types only — imported by the CLI and the report.
 
 export type ToolCategory = "read" | "edit" | "exec" | "agent" | "mcp" | "other";
 
@@ -10,28 +10,18 @@ export interface ToolCall {
   id: string;
   name: string;
   category: ToolCategory;
-  /** True when this exec call (Bash/PowerShell) matched the read-only allowlist. */
-  readOnly: boolean;
   /** Short human summary of the input: a path, a pattern, a command line. */
   summary: string;
-  /** Paths this call reads or writes, normalized for comparison. */
-  paths: string[];
-  /**
-   * How many turns back (1 = previous turn) the nearest tool result that mentions this
-   * call's inputs is, within the same agent. 0 = no earlier result (within the lookback
-   * window) references it, i.e. the call probably didn't depend on a prior result.
-   */
-  refsBack: number;
+  /** The input, readable (a shell command as-is, otherwise JSON), capped. */
+  input: string;
+  /** The result text, capped. Undefined when no result was recorded. */
+  result?: string;
+  /** Length of the full result text, before capping. */
+  resultChars?: number;
   startedAt: number;
   finishedAt?: number;
   isError: boolean;
   denied: boolean;
-  /** Byte offset of the JSONL line holding the tool_use block, in `file`. */
-  offset: number;
-  /** Byte offset of the JSONL line holding the tool_result, in `file`. */
-  resultOffset?: number;
-  /** Index into Session.files. */
-  file: number;
   subagent?: SubagentRun;
 }
 
@@ -69,12 +59,15 @@ export interface Prompt {
   id: string;
   index: number;
   kind: PromptKind;
+  /** The prompt as typed (capped), newlines kept. */
   text: string;
   startedAt: number;
   interrupted: boolean;
   compacted: boolean;
   /** Main-thread turns, in order. Subagent turns hang off ToolCall.subagent. */
   turns: Turn[];
+  /** Subagent runs that couldn't be tied to the call that spawned them, filed by start time. */
+  detached?: SubagentRun[];
 }
 
 export interface SubagentRun {
@@ -92,11 +85,7 @@ export interface Session {
   title?: string;
   startedAt: number;
   endedAt: number;
-  /** Source JSONL files; ToolCall.file indexes into this. Index 0 is the main session file. */
-  files: string[];
   prompts: Prompt[];
-  /** Times Claude Code itself nudged the model to batch (batching_reminder_sent attachments). */
-  batchingReminders: number;
 }
 
 export interface ProjectInfo {

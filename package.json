@@ -1,10 +1,10 @@
 {
-  "name": "turn-timer",
-  "version": "0.1.0",
-  "description": "Inspect Claude Code session logs: tool calls per turn, batching, and wasted round-trips",
+  "name": "claude-session-viewer",
+  "version": "0.2.0",
+  "description": "An HTML report of your Claude Code sessions: what they cost, where the time went, and cache misses",
   "type": "module",
   "bin": {
-    "turn-timer": "dist/cli/index.js"
+    "claude-sessions": "dist/cli/index.js"
   },
   "files": [
     "dist"
@@ -21,7 +21,6 @@
   },
   "license": "MIT",
   "dependencies": {
-    "@inquirer/prompts": "^8.7.2",
     "commander": "^15.0.0",
     "picocolors": "^1.1.1"
   },

@@ -1,36 +1,24 @@
 import { writeFileSync } from "node:fs";
-import { join } from "node:path";
 import { describe, expect, it } from "vitest";
-import { isReadOnlyCommand } from "../src/core/classify.js";
-import { DEFAULT_CONFIG } from "../src/core/config.js";
-import { emptyUsage, priceOf } from "../src/core/cost.js";
+import { priceOf } from "../src/core/cost.js";
 import { listProjects, listSessions } from "../src/core/discover.js";
-import { readLineAt, readLines } from "../src/core/lines.js";
-import { findRuns, promptStats, sessionStats } from "../src/core/metrics.js";
+import { readLines } from "../src/core/lines.js";
+import { analyzeSession, promptActiveMs } from "../src/core/metrics.js";
 import { parseSession } from "../src/core/parse.js";
+import { sessionRow, trimPreviews } from "../src/core/report-data.js";
+import type { Session } from "../src/core/types.js";
 import { LogBuilder, writeSession } from "./fixture.js";
 
-const cfg = DEFAULT_CONFIG;
-
 describe("readLines", () => {
-  it("tracks byte offsets across LF, CRLF and multi-byte text", async () => {
-    const { path } = writeSession(new LogBuilder().prompt("héllo ✓", "p1").prompt("second", "p2"), [], { crlf: true });
-    const lines = [];
-    for await (const l of readLines(path)) lines.push(l);
-    expect(lines).toHaveLength(2);
-    for (const l of lines) expect(await readLineAt(path, l.offset)).toBe(l.text);
-    expect(JSON.parse(lines[0]!.text).message.content).toBe("héllo ✓");
-  });
-
-  it("handles lines larger than the read chunk and a truncated last line", async () => {
+  it("handles CRLF, multi-byte text, lines larger than the read chunk and a truncated last line", async () => {
     const big = "x".repeat(3 << 20);
-    const { path } = writeSession(new LogBuilder().prompt(big, "p1"));
+    const { path } = writeSession(new LogBuilder().prompt("héllo ✓", "p1").prompt(big, "p2"), [], { crlf: true });
     writeFileSync(path, '{"type":"user","trunc', { flag: "a" });
     const lines = [];
     for await (const l of readLines(path)) lines.push(l);
-    expect(lines).toHaveLength(2);
-    expect(JSON.parse(lines[0]!.text).message.content).toHaveLength(big.length);
-    expect(lines[1]!.offset).toBe(lines[0]!.text.length + 1);
+    expect(lines).toHaveLength(3);
+    expect(JSON.parse(lines[0]!.text).message.content).toBe("héllo ✓");
+    expect(JSON.parse(lines[1]!.text).message.content).toHaveLength(big.length);
   });
 });
 
@@ -42,8 +30,7 @@ describe("parseSession", () => {
       .turn("m2", [["Edit", { file_path: "C:\\proj\\a.ts" }]], { promptId: "p1" })
       .turn("m3", [], { text: "Done", promptId: "p1" })
       .prompt("thanks", "p2");
-    const { path } = writeSession(log);
-    const s = await parseSession(path, cfg);
+    const s = await parseSession(writeSession(log).path);
 
     expect(s.prompts.map((p) => p.text)).toEqual(["look at the code", "thanks"]);
     const [p1] = s.prompts;
@@ -51,12 +38,34 @@ describe("parseSession", () => {
     expect(p1!.turns[0]!.hasText).toBe(true);
     expect(p1!.turns[0]!.toolCalls.map((c) => c.category)).toEqual(["read", "read", "read"]);
     expect(p1!.turns[0]!.toolCalls[0]!.finishedAt).toBeGreaterThan(0);
+    expect(analyzeSession(s).prompts[0]).toMatchObject({ turns: 3, toolCalls: 4 });
+  });
 
-    const st = promptStats(p1!);
-    expect(st.toolCalls).toBe(4);
-    expect(st.toolTurns).toBe(2);
-    expect(st.singleCallTurns).toBe(1);
-    expect(st.histogram).toEqual([1, 0, 1, 0, 0, 0]);
+  it("counts history a resumed session copied into its log once", async () => {
+    const log = new LogBuilder().prompt("look at the code", "p1").turn("m1", [["Read", { file_path: "C:\\proj\\a.ts" }]], { promptId: "p1" });
+    // The resumed session re-writes those records, uuids unchanged but under a new promptId.
+    const copies = log.records.map((r) => ({ ...r, promptId: r.promptId && "p2" }));
+    log.records.push(...copies);
+    log.prompt("carry on", "p3").turn("m2", [["Read", { file_path: "C:\\proj\\b.ts" }]], { promptId: "p3" });
+    const s = await parseSession(writeSession(log).path);
+
+    expect(s.prompts.map((p) => p.text)).toEqual(["look at the code", "carry on"]);
+    expect(s.prompts.map((p) => p.turns[0]!.toolCalls.length)).toEqual([1, 1]);
+  });
+
+  it("keeps the whole prompt, and each call's input and result", async () => {
+    const prompt = "Fix the login bug.\n\nSteps:\n1. open the page\n2. " + "detail ".repeat(100);
+    const log = new LogBuilder()
+      .prompt(prompt, "p1")
+      .turn("m1", [["Bash", { command: "npm test", description: "Run tests" }, "3 passed"], ["Read", { file_path: "/a" }, "y".repeat(5000)]], { promptId: "p1" });
+    const s = await parseSession(writeSession(log).path);
+    expect(s.prompts[0]!.text).toBe(prompt.trim());
+    const [bash, read] = s.prompts[0]!.turns[0]!.toolCalls;
+    expect(bash).toMatchObject({ summary: "npm test", input: "npm test\n\n# Run tests", result: "3 passed", resultChars: 8 });
+    expect(read!.input).toContain('"file_path": "/a"');
+    expect(read!.resultChars).toBe(5000);
+    expect(read!.result!.length).toBeLessThan(1100);
+    expect(read!.result).toContain("4,000 more characters");
   });
 
   it("keeps meta, compact summaries and interrupts inside the current prompt", async () => {
@@ -69,13 +78,48 @@ describe("parseSession", () => {
       .prompt("<command-name>/model</command-name>\n<command-args></command-args>", "p2")
       .prompt("continue", "p2")
       .prompt("<task-notification>\n<summary>Agent finished</summary></task-notification>", "p3");
-    const s = await parseSession((writeSession(log)).path, cfg);
+    const s = await parseSession(writeSession(log).path);
     expect(s.prompts).toHaveLength(3);
     expect(s.prompts[0]!.interrupted).toBe(true);
     expect(s.prompts[0]!.compacted).toBe(true);
     expect(s.prompts[1]!.kind).toBe("command");
     expect(s.prompts[1]!.text).toBe("/model → continue");
     expect(s.prompts[2]!.kind).toBe("notification");
+  });
+
+  it("reads tool results that share a record with text, without opening a prompt", async () => {
+    const log = new LogBuilder()
+      .prompt("go", "p1")
+      .raw({ type: "assistant", message: { id: "m1", model: "claude-opus-5", role: "assistant", content: [{ type: "tool_use", id: "c1", name: "Bash", input: { command: "sleep 5" } }] } })
+      .wait(5000)
+      .raw({
+        type: "user",
+        promptId: "p1",
+        message: { role: "user", content: [{ type: "tool_result", tool_use_id: "c1", content: "done" }, { type: "text", text: "[Request interrupted by user for tool use]" }] },
+      });
+    const s = await parseSession(writeSession(log).path);
+    expect(s.prompts).toHaveLength(1);
+    expect(s.prompts[0]!.interrupted).toBe(true);
+    const call = s.prompts[0]!.turns[0]!.toolCalls[0]!;
+    expect(call.result).toBe("done");
+    expect(call.finishedAt! - call.startedAt).toBe(6000);
+  });
+
+  it("doesn't open an empty prompt when a record reuses an earlier prompt's id", async () => {
+    const log = new LogBuilder()
+      .prompt("first", "p1")
+      .turn("m1", [["Read", { file_path: "/a" }]], { promptId: "p1" })
+      .prompt("second", "p2")
+      .turn("m2", [["Read", { file_path: "/b" }]], { promptId: "p1" })
+      .prompt("[Request interrupted by user]", "p1")
+      .prompt("This session is being continued...", "p1", { isCompactSummary: true })
+      .prompt("Base directory for this skill: /x", "p3", { isMeta: true })
+      .turn("m3", [], { text: "ok" })
+      .raw({ type: "user", promptId: "p4", message: { role: "user", content: [{ type: "image", source: { type: "base64", data: "" } }] } });
+    const s = await parseSession(writeSession(log).path);
+    expect(s.prompts.map((p) => p.text)).toEqual(["first", "second", "[image]"]);
+    expect(s.prompts[1]).toMatchObject({ interrupted: true, compacted: true });
+    expect(s.prompts[1]!.turns.map((t) => t.messageId)).toEqual(["m2", "m3"]);
   });
 
   it("attaches subagent turns to the Agent call that spawned them", async () => {
@@ -89,20 +133,24 @@ describe("parseSession", () => {
       .turn("s3", [], { text: "Findings" });
     const s = await parseSession(
       writeSession(main, [{ id: "abc", log: sub, meta: { agentType: "general-purpose", description: "Review code", toolUseId: "m1_t0", spawnDepth: 1 } }]).path,
-      cfg,
     );
     const call = s.prompts[0]!.turns[0]!.toolCalls[0]!;
     expect(call.subagent?.turns).toHaveLength(3);
     expect(call.subagent!.turns[0]!.agent).toMatchObject({ kind: "subagent", agentType: "general-purpose" });
-    expect(s.files).toHaveLength(2);
-    expect(call.subagent!.turns[0]!.toolCalls[0]!.file).toBe(1);
+    expect(analyzeSession(s).total).toMatchObject({ turns: 4, toolCalls: 3, subagents: 1 });
+  });
 
-    const withSubs = promptStats(s.prompts[0]!);
-    const mainOnly = promptStats(s.prompts[0]!, { subagents: false });
-    expect(withSubs.toolCalls).toBe(3);
-    expect(mainOnly.toolCalls).toBe(1);
-    expect(withSubs.runs).toHaveLength(1);
-    expect(withSubs.runs[0]!.agent.kind).toBe("subagent");
+  it("still counts subagents it can't tie to a call, and old-style inline sidechains", async () => {
+    const usage = { input_tokens: 0, cache_read_input_tokens: 1_000_000, output_tokens: 0 };
+    const main = new LogBuilder()
+      .prompt("go", "p1")
+      .turn("m1", [["Agent", { description: "x" }]], { promptId: "p1", usage })
+      .raw({ type: "assistant", isSidechain: true, message: { id: "side1", model: "claude-opus-5", role: "assistant", content: [{ type: "text", text: "hi" }], usage } });
+    const orphan = new LogBuilder(true, "zzz").prompt("task", "p1").turn("o1", [], { text: "done", usage });
+    const s = await parseSession(writeSession(main, [{ id: "zzz", log: orphan, meta: { agentType: "Explore" } }]).path);
+    expect(s.prompts[0]!.detached?.map((r) => r.agentType).sort()).toEqual(["Explore", "sidechain"]);
+    // Three turns, each reading $0.50 of cache at Opus 5's rate.
+    expect(analyzeSession(s).total.cost.total).toBeCloseTo(1.5, 10);
   });
 
   it("skips synthetic assistant messages and records denied calls", async () => {
@@ -110,91 +158,115 @@ describe("parseSession", () => {
       .prompt("go", "p1")
       .raw({ type: "assistant", message: { id: "syn", model: "<synthetic>", content: [{ type: "text", text: "API error" }] } })
       .turn("m1", [["Bash", { command: "rm -rf build" }]], { promptId: "p1", denied: true });
-    const s = await parseSession(writeSession(log).path, cfg);
+    const s = await parseSession(writeSession(log).path);
     expect(s.prompts[0]!.turns).toHaveLength(1);
     expect(s.prompts[0]!.turns[0]!.toolCalls[0]!.denied).toBe(true);
   });
 });
 
-describe("batchable runs", () => {
-  it("flags consecutive independent single reads as likely batchable", async () => {
-    const log = new LogBuilder()
-      .prompt("explore", "p1")
-      .turn("m1", [["Read", { file_path: "/p/a.ts" }]], { promptId: "p1" })
-      .wait(4000)
-      .turn("m2", [["Read", { file_path: "/p/b.ts" }]], { promptId: "p1" })
-      .wait(4000)
-      .turn("m3", [["Bash", { command: "git status" }]], { promptId: "p1" })
-      .turn("m4", [["Bash", { command: "npm run build" }]], { promptId: "p1" });
-    const s = await parseSession(writeSession(log).path, cfg);
-    const st = sessionStats(s);
-    expect(st.runs).toHaveLength(1);
-    expect(st.runs[0]).toMatchObject({ kind: "likely", turnIds: ["m1", "m2", "m3"], savedTurns: 2 });
-    expect(st.runs[0]!.savedMs).toBeGreaterThanOrEqual(8000);
+describe("time", () => {
+  it("counts time once when a subagent keeps running into the next prompt", async () => {
+    const main = new LogBuilder()
+      .prompt("one", "p1") // t=1s
+      .turn("m1", [], { text: "started it", promptId: "p1" }) // t=2s
+      .wait(60_000)
+      .prompt("two", "p2") // t=63s
+      .turn("m2", [], { text: "ok", promptId: "p2" }); // t=64s
+    const bg = new LogBuilder(true, "bg").prompt("task", "p1").wait(100_000).turn("b1", [], { text: "done" }); // t=1s … 102s
+    const s = await parseSession(writeSession(main, [{ id: "bg", log: bg, meta: { agentType: "general-purpose" } }]).path);
+    const a = analyzeSession(s);
+    expect(a.prompts.map((p) => p.activeMs)).toEqual([101_000, 1000]);
+    expect(a.total.activeMs).toBe(101_000);
   });
 
-  it("breaks a run when a call uses a path found in an earlier result", async () => {
+  it("measures each prompt from the prompt to its last activity, leaving out idle time between prompts", async () => {
     const log = new LogBuilder()
-      .prompt("find", "p1")
-      .turn("m1", [["Grep", { pattern: "handleLogin" }, "src/auth/login.ts:12: function handleLogin"]], { promptId: "p1" })
-      .turn("m2", [["Read", { file_path: "C:\\p\\src\\auth\\login.ts" }]], { promptId: "p1" })
-      .turn("m3", [["Read", { file_path: "C:\\p\\src\\other.ts" }]], { promptId: "p1" });
-    const s = await parseSession(writeSession(log).path, cfg);
-    const turns = s.prompts[0]!.turns;
-    expect(turns[1]!.toolCalls[0]!.refsBack).toBe(1);
-    expect(turns[2]!.toolCalls[0]!.refsBack).toBe(0);
-    // m1 → m2 is dependent; m2 → m3 is independent.
-    expect(findRuns(turns, 0).map((r) => r.turnIds)).toEqual([["m2", "m3"]]);
-  });
-
-  it("treats edits to different files as possibly batchable, same file as sequential", async () => {
-    const log = new LogBuilder()
-      .prompt("fix", "p1")
-      .turn("m1", [["Edit", { file_path: "/p/a.ts" }]], { promptId: "p1" })
-      .turn("m2", [["Edit", { file_path: "/p/b.ts" }]], { promptId: "p1" })
-      .turn("m3", [["Edit", { file_path: "/p/b.ts" }]], { promptId: "p1" });
-    const s = await parseSession(writeSession(log).path, cfg);
-    const runs = findRuns(s.prompts[0]!.turns, 0);
-    expect(runs).toHaveLength(1);
-    expect(runs[0]).toMatchObject({ kind: "possibly", turnIds: ["m1", "m2"] });
+      .prompt("one", "p1") // t=1s
+      .wait(9000)
+      .turn("m1", [["Bash", { command: "npm test" }]], { promptId: "p1" }) // response 11s, result 12s
+      .wait(3_600_000)
+      .prompt("two", "p2")
+      .wait(4000)
+      .turn("m2", [], { text: "ok", promptId: "p2" });
+    const s = await parseSession(writeSession(log).path);
+    expect(promptActiveMs(s.prompts[0]!)).toBe(11_000);
+    expect(promptActiveMs(s.prompts[1]!)).toBe(5000);
+    const st = analyzeSession(s).total;
+    expect(st.activeMs).toBe(16_000);
+    expect(st.modelMs).toBe(10_000 + 5000);
+    expect(st.slowest[0]).toMatchObject({ name: "Bash", ms: 1000, promptIndex: 0 });
+    expect(st.byTool.Bash).toMatchObject({ calls: 1, totalMs: 1000 });
   });
 });
 
-describe("isReadOnlyCommand", () => {
-  const ro = (c: string) => isReadOnlyCommand(c, cfg.readOnlyCommands);
-  it.each([
-    "git status",
-    "git -C /repo log --oneline -5",
-    "ls -la && cat package.json",
-    "grep -rn foo src | head -20",
-    "cd /p && git diff HEAD~1 2>/dev/null",
-    "Get-ChildItem -Recurse | Select-Object -First 5",
-    "timeout 60 git log -3; sed -n '1,90p' a.shader",
-    "wc -l x.cs; sed -n '1,120p' x.cs",
-  ])("read-only: %s", (c) => expect(ro(c)).toBe(true));
-  it.each(["npm install", "git commit -m x", "echo hi > out.txt", "rm -rf dist", "ls && npm test", "sed -i 's/a/b/' f", "timeout 60 unity cmd recompile", ""])(
-    "not read-only: %s",
-    (c) => expect(ro(c)).toBe(false),
-  );
+describe("cache misses", () => {
+  // A turn that read `read` tokens from the cache and wrote `write` (5-minute or 1-hour).
+  const u = (read: number, write: number, ttl: "5m" | "1h" = "5m") => ({
+    input_tokens: 10,
+    cache_read_input_tokens: read,
+    cache_creation_input_tokens: write,
+    cache_creation: { ephemeral_5m_input_tokens: ttl === "5m" ? write : 0, ephemeral_1h_input_tokens: ttl === "1h" ? write : 0 },
+    output_tokens: 100,
+  });
+
+  it("flags a rebuild after the TTL as expired and prices the rewrite", async () => {
+    const log = new LogBuilder()
+      .prompt("start", "p1")
+      .turn("m1", [], { text: "a", usage: u(0, 100_000) })
+      .turn("m2", [], { text: "b", usage: u(100_000, 2000) })
+      .wait(6 * 60_000)
+      .prompt("back again", "p2")
+      .turn("m3", [], { text: "c", usage: u(0, 103_000) });
+    const s = await parseSession(writeSession(log).path);
+    const a = analyzeSession(s);
+    expect(a.total.misses).toHaveLength(1);
+    const m = a.total.misses[0]!;
+    expect(m).toMatchObject({ kind: "expired", messageId: "m3", promptIndex: 1, ttlMs: 300_000, rebuiltTokens: 102_010 });
+    expect(m.gapMs).toBeGreaterThan(300_000);
+    // Opus 5: 5-minute writes at 1.25 × $5, reads at $0.50.
+    expect(m.cost).toBeCloseTo((102_010 * (6.25 - 0.5)) / 1e6, 10);
+    expect(a.prompts[1]!.missCost).toBeCloseTo(m.cost, 10);
+    expect(a.total.ttl).toBe("5m");
+    expect(sessionRow(s, { id: "sess", projectDir: "C--proj", path: "", size: 1, mtime: 0, subagentCount: 0 }, a)).toMatchObject({
+      misses: 1,
+      expiries: 1,
+      ttl: "5m",
+    });
+  });
+
+  it("uses the 1-hour TTL once the stream writes 1-hour entries", async () => {
+    const log = new LogBuilder()
+      .prompt("start", "p1")
+      .turn("m1", [], { text: "a", usage: u(0, 100_000, "1h") })
+      .wait(20 * 60_000)
+      .prompt("back", "p2")
+      .turn("m2", [], { text: "b", usage: u(0, 101_000, "1h") });
+    const a = analyzeSession(await parseSession(writeSession(log).path));
+    expect(a.total.misses[0]).toMatchObject({ kind: "invalidated", ttlMs: 3_600_000 });
+    expect(a.total.ttl).toBe("1h");
+  });
+
+  it("tells model switches apart, and ignores compaction and normal growth", async () => {
+    const log = new LogBuilder()
+      .prompt("start", "p1")
+      .turn("m1", [], { text: "a", usage: u(0, 200_000) })
+      .turn("m2", [], { text: "b", usage: u(200_000, 5000) })
+      .prompt("/compact", "p2")
+      .turn("m3", [], { text: "summary", usage: u(0, 20_000) })
+      .prompt("/model", "p3")
+      .turn("m4", [], { text: "c", model: "claude-opus-5-5", usage: u(0, 21_000) });
+    const a = analyzeSession(await parseSession(writeSession(log).path));
+    expect(a.total.misses.map((m) => [m.messageId, m.kind])).toEqual([["m4", "model-switch"]]);
+  });
 });
 
 describe("discover", () => {
   it("lists projects and sessions with first prompt and cwd", async () => {
-    const { root } = writeSession(new LogBuilder().raw({ type: "custom-title", customTitle: "My title" }).prompt("hello world", "p1"));
+    const { root, path } = writeSession(new LogBuilder().raw({ type: "custom-title", customTitle: "My title" }).prompt("hello world", "p1"));
     const projects = await listProjects(root);
     expect(projects).toEqual([expect.objectContaining({ dir: "C--proj", cwd: "C:\\proj", sessionCount: 1 })]);
     const sessions = await listSessions("C--proj", root);
-    expect(sessions[0]).toMatchObject({ id: "sess", firstPrompt: "hello world", title: "My title" });
-    expect(sessions[0]!.path).toBe(join(root, "C--proj", "sess.jsonl"));
-  });
-});
-
-describe("turnOverheadMs", () => {
-  it("subtracts output generation time from model latency", async () => {
-    const { turnOverheadMs, MS_PER_OUTPUT_TOKEN } = await import("../src/core/metrics.js");
-    const t = { requestedAt: 0, respondedAt: 30_000, usage: { ...emptyUsage(), output: 2000 } } as Parameters<typeof turnOverheadMs>[0];
-    expect(turnOverheadMs(t)).toBe(30_000 - 2000 * MS_PER_OUTPUT_TOKEN);
-    expect(turnOverheadMs({ ...t, usage: { ...t.usage, output: 10_000 } })).toBe(0);
+    expect(sessions[0]).toMatchObject({ id: "sess", firstPrompt: "hello world", title: "My title", path });
   });
 });
 
@@ -212,10 +284,10 @@ describe("cost", () => {
     const log = new LogBuilder()
       .prompt("go", "p1")
       .turn("m1", [["Read", { file_path: "/a" }], ["Read", { file_path: "/b" }]], { text: "hi", promptId: "p1", usage: usage({}) });
-    const s = await parseSession(writeSession(log).path, cfg);
+    const s = await parseSession(writeSession(log).path);
     const t = s.prompts[0]!.turns[0]!;
     expect(t.usage).toMatchObject({ input: 10, cacheWrite5m: 1000, cacheWrite1h: 2000, cacheRead: 100_000, output: 500 });
-    const st = sessionStats(s);
+    const st = analyzeSession(s).total;
     expect(st.tokens).toEqual({ input: 10, cacheWrite: 3000, cacheRead: 100_000, output: 500 });
     // Opus 5: $5 in, $25 out, $0.50 cache read; writes 1.25× / 2× input.
     const expected = (10 * 5 + 1000 * 5 * 1.25 + 2000 * 5 * 2 + 100_000 * 0.5 + 500 * 25) / 1e6;
@@ -224,29 +296,24 @@ describe("cost", () => {
     expect(st.byModel["claude-opus-5"]).toMatchObject({ turns: 1, priced: true });
   });
 
+  it("prices Opus 5.5 cache reads at 0.05× input", async () => {
+    const log = new LogBuilder().prompt("go", "p1").turn("m1", [], { text: "a", model: "claude-opus-5-5", usage: usage({}) });
+    const st = analyzeSession(await parseSession(writeSession(log).path)).total;
+    expect(st.cost.cacheRead).toBeCloseTo((100_000 * 0.2) / 1e6, 10);
+    expect(st.cost.cacheWrite).toBeCloseTo((1000 * 4 * 1.25 + 2000 * 4 * 2) / 1e6, 10);
+  });
+
   it("treats writes without a TTL breakdown as 5-minute, applies fast mode, and skips unknown models", async () => {
     const log = new LogBuilder()
       .prompt("go", "p1")
       .turn("m1", [], { text: "a", usage: usage({ cache_creation: undefined, speed: "fast" }) })
       .turn("m2", [], { text: "b", model: "claude-opus-9", usage: usage({}) });
-    const s = await parseSession(writeSession(log).path, cfg);
+    const s = await parseSession(writeSession(log).path);
     const [t1] = s.prompts[0]!.turns;
     expect(t1!.usage).toMatchObject({ cacheWrite5m: 3000, cacheWrite1h: 0, fast: true });
-    const st = sessionStats(s);
+    const st = analyzeSession(s).total;
     expect(st.unpricedTurns).toBe(1);
     expect(st.cost.total).toBeCloseTo((2 * (10 * 5 + 3000 * 5 * 1.25 + 100_000 * 0.5 + 500 * 25)) / 1e6, 10);
-  });
-
-  it("prices batchable runs by the context re-reads of the extra turns", async () => {
-    const u = usage({ cache_creation_input_tokens: 0, cache_creation: undefined });
-    const log = new LogBuilder()
-      .prompt("explore", "p1")
-      .turn("m1", [["Read", { file_path: "/p/a.ts" }]], { promptId: "p1", usage: u })
-      .turn("m2", [["Read", { file_path: "/p/b.ts" }]], { promptId: "p1", usage: u })
-      .turn("m3", [["Read", { file_path: "/p/c.ts" }]], { promptId: "p1", usage: u });
-    const st = sessionStats(await parseSession(writeSession(log).path, cfg));
-    expect(st.runs[0]!.savedCost).toBeCloseTo((2 * (10 * 5 + 100_000 * 0.5)) / 1e6, 10);
-    expect(st.savedCost).toBe(st.runs[0]!.savedCost);
   });
 
   it("resolves dated, provider-prefixed and unknown model ids", () => {
@@ -257,5 +324,23 @@ describe("cost", () => {
     expect(priceOf("claude-opus-5")?.input).toBe(5);
     expect(priceOf("claude-opus-4-9")).toBeUndefined();
     expect(priceOf("<synthetic>")).toBeUndefined();
+  });
+});
+
+describe("trimPreviews", () => {
+  it("shortens previews in busy sessions and keeps the count of what was cut", () => {
+    const calls = Array.from({ length: 40_000 }, () => ({ category: "shell", input: "x".repeat(1000), result: `${"y".repeat(1000)}\n… 4,000 more characters` }));
+    const session = { prompts: [{ turns: [{ calls }] }] } as unknown as Session;
+    trimPreviews(session);
+    expect(calls[0]!.input).toBe(`${"x".repeat(300)}\n… 700 more characters`);
+    expect(calls[0]!.result).toBe(`${"y".repeat(300)}\n… 4,700 more characters`);
+  });
+
+  it("keeps the count of what was cut when only the note is over the budget", () => {
+    // 7,920 calls leave 1,010 characters per preview: the 1,000-character body fits, its note doesn't.
+    const result = `${"y".repeat(1000)}\n… 4,000 more characters`;
+    const calls = Array.from({ length: 7920 }, () => ({ category: "shell", input: "x", result }));
+    trimPreviews({ prompts: [{ turns: [{ calls }] }] } as unknown as Session);
+    expect(calls[0]!.result).toBe(result);
   });
 });

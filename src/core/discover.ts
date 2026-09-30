@@ -50,9 +50,10 @@ async function listSessionFiles(dir: string): Promise<{ id: string; path: string
   return out;
 }
 
-export async function listSessions(projectDir: string, root = projectsDir()): Promise<SessionInfo[]> {
+/** A project's sessions, newest first; `sinceMs` skips older logs before reading them. */
+export async function listSessions(projectDir: string, root = projectsDir(), sinceMs = 0): Promise<SessionInfo[]> {
   const dir = join(root, projectDir);
-  const files = await listSessionFiles(dir);
+  const files = (await listSessionFiles(dir)).filter((f) => f.mtime >= sinceMs);
   const out: SessionInfo[] = [];
   for (const f of files) {
     const [head, tail, subagentCount] = await Promise.all([
@@ -81,7 +82,7 @@ export async function listAllSessions(opts: { sinceMs?: number; projectDirs?: st
   const dirs = opts.projectDirs ?? (await listProjects(root)).map((p) => p.dir);
   const out: SessionInfo[] = [];
   for (const dir of dirs) {
-    for (const s of await listSessions(dir, root)) if (!opts.sinceMs || s.mtime >= opts.sinceMs) out.push(s);
+    out.push(...(await listSessions(dir, root, opts.sinceMs)));
   }
   return out.sort((a, b) => b.mtime - a.mtime);
 }

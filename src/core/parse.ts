@@ -1,26 +1,20 @@
 import { readFile } from "node:fs/promises";
 import { basename, dirname, join } from "node:path";
-import { classify, normalizePath } from "./classify.js";
-import type { Config } from "./config.js";
+import { cap, classify, inputText } from "./classify.js";
 import { subagentFiles } from "./discover.js";
 import { readLines, tryParse } from "./lines.js";
-import { INTERRUPT_PREFIX, blocks, isToolResultRecord, promptTextOf, toolResultText, ts, userText } from "./records.js";
+import { INTERRUPT_PREFIX, blocks, hasToolResults, promptTextOf, toolResultText, ts, userText } from "./records.js";
 import { emptyUsage } from "./cost.js";
 import type { AgentRef, Prompt, Session, SubagentRun, ToolCall, Turn, Usage } from "./types.js";
 
-/** Cap on result text kept per call for the dependency heuristic. */
-const RESULT_TEXT_CAP = 256 << 10;
+/** Cap on the result text kept per call. */
+const RESULT_CAP = 1000;
 
 interface StreamState {
   agent: AgentRef;
-  fileIndex: number;
   turns: Turn[];
   turnsById: Map<string, Turn>;
-  /** Turn index (within this stream) of each turn, by message id. */
-  turnIndex: Map<string, number>;
-  pending: Map<string, { call: ToolCall; turnIdx: number }>;
-  /** Recent tool result texts, newest last: normalized text and the turn that produced it. */
-  recent: { turnIdx: number; text: string }[];
+  pending: Map<string, ToolCall>;
   lastEventAt: number;
 }
 
@@ -31,25 +25,15 @@ interface SessionState {
   endedAt: number;
   prompts: Prompt[];
   current?: Prompt;
-  batchingReminders: number;
+  /** Old-style subagent records inline in the main file (isSidechain), one stream per prompt. */
+  sidechains: Map<Prompt, StreamState>;
 }
 
-function newStream(agent: AgentRef, fileIndex: number): StreamState {
-  return {
-    agent,
-    fileIndex,
-    turns: [],
-    turnsById: new Map(),
-    turnIndex: new Map(),
-    pending: new Map(),
-    recent: [],
-    lastEventAt: 0,
-  };
+function newStream(agent: AgentRef): StreamState {
+  return { agent, turns: [], turnsById: new Map(), pending: new Map(), lastEventAt: 0 };
 }
 
-const normText = (s: string) => s.slice(0, RESULT_TEXT_CAP).replace(/\\\\?/g, "/").toLowerCase();
-
-function handleAssistant(rec: any, offset: number, st: StreamState, config: Config): Turn | undefined {
+function handleAssistant(rec: any, st: StreamState): Turn | undefined {
   const msg = rec.message;
   if (!msg || msg.model === "<synthetic>") return undefined;
   const id: string = msg.id ?? rec.uuid;
@@ -70,10 +54,8 @@ function handleAssistant(rec: any, offset: number, st: StreamState, config: Conf
       usage: emptyUsage(),
     };
     st.turnsById.set(id, turn);
-    st.turnIndex.set(id, st.turns.length);
     st.turns.push(turn);
   }
-  const turnIdx = st.turnIndex.get(id)!;
   if (at > turn.respondedAt) turn.respondedAt = at;
   if (msg.usage) mergeUsage(turn.usage, msg.usage);
 
@@ -81,23 +63,19 @@ function handleAssistant(rec: any, offset: number, st: StreamState, config: Conf
     if (b?.type === "text" && b.text?.trim()) turn.hasText = true;
     else if (b?.type === "thinking" || b?.type === "redacted_thinking") turn.hasThinking = true;
     else if (b?.type === "tool_use") {
-      const c = classify(b.name, b.input, config);
+      const c = classify(b.name, b.input);
       const call: ToolCall = {
         id: b.id,
         name: b.name,
         category: c.category,
-        readOnly: c.readOnly,
         summary: c.summary,
-        paths: c.paths,
-        refsBack: findReference(c.needles, turnIdx, st, config.dependencyLookback),
+        input: inputText(b.input),
         startedAt: at,
         isError: false,
         denied: false,
-        offset,
-        file: st.fileIndex,
       };
       turn.toolCalls.push(call);
-      st.pending.set(b.id, { call, turnIdx });
+      st.pending.set(b.id, call);
     }
   }
   return isNew ? turn : undefined;
@@ -123,37 +101,19 @@ function mergeUsage(u: Usage, raw: any) {
   if (raw.speed === "fast") u.fast = true;
 }
 
-function findReference(needles: string[], turnIdx: number, st: StreamState, lookback: number): number {
-  if (!needles.length) return 0;
-  const ns = needles.map((n) => normalizePath(n));
-  for (let i = st.recent.length - 1; i >= 0; i--) {
-    const r = st.recent[i]!;
-    const back = turnIdx - r.turnIdx;
-    if (back <= 0) continue;
-    if (back > lookback) break;
-    if (ns.some((n) => r.text.includes(n))) return back;
-  }
-  return 0;
-}
-
-function handleToolResults(rec: any, offset: number, st: StreamState, lookback: number) {
+function handleToolResults(rec: any, st: StreamState) {
   const at = ts(rec);
   for (const b of blocks(rec)) {
     if (b?.type !== "tool_result") continue;
-    const p = st.pending.get(b.tool_use_id);
-    if (!p) continue;
+    const call = st.pending.get(b.tool_use_id);
+    if (!call) continue;
     st.pending.delete(b.tool_use_id);
-    p.call.finishedAt = at;
-    p.call.resultOffset = offset;
-    p.call.isError = b.is_error === true;
-    if (rec.toolDenialKind) p.call.denied = true;
-    const text = toolResultText(b);
-    if (text) {
-      st.recent.push({ turnIdx: p.turnIdx, text: normText(text) });
-      // Drop results that are out of the lookback window for any future turn.
-      const minIdx = st.turns.length - lookback - 1;
-      while (st.recent.length && st.recent[0]!.turnIdx < minIdx) st.recent.shift();
-    }
+    call.finishedAt = at;
+    call.isError = b.is_error === true;
+    if (rec.toolDenialKind) call.denied = true;
+    const text = toolResultText(b) || (Array.isArray(b.content) && b.content.length ? "[non-text result]" : "");
+    call.result = cap(text, RESULT_CAP);
+    call.resultChars = text.length;
   }
   if (at) st.lastEventAt = at;
 }
@@ -179,38 +139,52 @@ function handleUserText(rec: any, ss: SessionState) {
   const at = ts(rec);
   const pid: string | undefined = rec.promptId;
   const parsed = promptTextOf(rec);
-  const startsNew = pid ? pid !== ss.current?.id : parsed !== undefined;
+  // Only a record with prompt text starts a prompt. Claude Code sometimes tags later records
+  // (interrupts, compact summaries, meta) with an earlier prompt's id; a changed id alone
+  // would open a prompt with no text, so those records stay with the current prompt.
+  const startsNew = parsed !== undefined && !(pid && pid === ss.current?.id);
   if (startsNew) {
     ss.current = {
       id: pid ?? rec.uuid ?? String(ss.prompts.length),
       index: ss.prompts.length,
-      kind: parsed?.kind ?? "user",
-      text: parsed?.text ?? "",
+      kind: parsed.kind,
+      text: parsed.text,
       startedAt: at,
       interrupted: false,
       compacted: false,
       turns: [],
     };
     ss.prompts.push(ss.current);
-  } else if (ss.current && parsed) {
-    if (!ss.current.text) {
-      ss.current.text = parsed.text;
-      ss.current.kind = parsed.kind;
-    } else if (ss.current.kind === "command" && parsed.kind === "user") {
-      // e.g. "/model" followed by "continue" under the same promptId
-      ss.current.text = `${ss.current.text} → ${parsed.text}`;
-    }
+  } else if (ss.current?.kind === "command" && parsed?.kind === "user") {
+    // e.g. "/model" followed by "continue" under the same promptId
+    ss.current.text = `${ss.current.text} → ${parsed.text}`;
   }
   const p = currentPrompt(ss, at);
   if (rec.isCompactSummary) p.compacted = true;
   if (userText(rec).trim().startsWith(INTERRUPT_PREFIX)) p.interrupted = true;
 }
 
-async function parseMainFile(path: string, st: StreamState, ss: SessionState, config: Config) {
+/**
+ * A resumed session's log starts with a copy of the history it resumed, records and uuids
+ * unchanged (one log here repeats its opening 15 times). Only a record's first copy counts.
+ */
+function firstCopy(rec: any, seen: Set<string>): boolean {
+  if (typeof rec.uuid !== "string") return true;
+  if (seen.has(rec.uuid)) return false;
+  seen.add(rec.uuid);
+  return true;
+}
+
+async function parseMainFile(path: string, st: StreamState, ss: SessionState) {
+  const seen = new Set<string>();
   for await (const line of readLines(path)) {
     const rec = tryParse(line.text);
-    if (!rec || rec.isSidechain) continue;
+    if (!rec || !firstCopy(rec, seen)) continue;
     const at = ts(rec);
+    if (rec.isSidechain) {
+      handleSidechain(rec, ss, at);
+      continue;
+    }
     if (at) {
       if (!ss.startedAt || at < ss.startedAt) ss.startedAt = at;
       if (at > ss.endedAt) ss.endedAt = at;
@@ -218,13 +192,15 @@ async function parseMainFile(path: string, st: StreamState, ss: SessionState, co
     if (!ss.cwd && typeof rec.cwd === "string") ss.cwd = rec.cwd;
     switch (rec.type) {
       case "assistant": {
-        const turn = handleAssistant(rec, line.offset, st, config);
+        const turn = handleAssistant(rec, st);
         if (turn) currentPrompt(ss, at).turns.push(turn);
         break;
       }
       case "user":
-        if (isToolResultRecord(rec)) {
-          handleToolResults(rec, line.offset, st, config.dependencyLookback);
+        if (hasToolResults(rec)) {
+          handleToolResults(rec, st);
+          // Text riding along with results never starts a prompt; an interrupt note still counts.
+          if (ss.current && userText(rec).trim().startsWith(INTERRUPT_PREFIX)) ss.current.interrupted = true;
         } else {
           handleUserText(rec, ss);
           if (at) st.lastEventAt = at;
@@ -233,9 +209,6 @@ async function parseMainFile(path: string, st: StreamState, ss: SessionState, co
       case "system":
         if (rec.subtype === "compact_boundary" && ss.current) ss.current.compacted = true;
         break;
-      case "attachment":
-        if (rec.attachment?.type === "batching_reminder_sent") ss.batchingReminders++;
-        break;
       case "custom-title":
         if (rec.customTitle) ss.title = rec.customTitle;
         break;
@@ -243,16 +216,28 @@ async function parseMainFile(path: string, st: StreamState, ss: SessionState, co
   }
 }
 
-async function parseSubagentFile(path: string, st: StreamState, config: Config, counters: { reminders: number }) {
+const SIDECHAIN = { kind: "subagent" as const, agentId: "sidechain", agentType: "sidechain", description: "Subagent logged in the main file", depth: 1 };
+
+function handleSidechain(rec: any, ss: SessionState, at: number) {
+  const p = currentPrompt(ss, at);
+  let st = ss.sidechains.get(p);
+  if (!st) ss.sidechains.set(p, (st = newStream(SIDECHAIN)));
+  if (rec.type === "assistant") handleAssistant(rec, st);
+  else if (rec.type === "user") {
+    if (hasToolResults(rec)) handleToolResults(rec, st);
+    else if (at) st.lastEventAt = at;
+  }
+}
+
+async function parseSubagentFile(path: string, st: StreamState) {
+  const seen = new Set<string>();
   for await (const line of readLines(path)) {
     const rec = tryParse(line.text);
-    if (!rec) continue;
-    if (rec.type === "assistant") handleAssistant(rec, line.offset, st, config);
+    if (!rec || !firstCopy(rec, seen)) continue;
+    if (rec.type === "assistant") handleAssistant(rec, st);
     else if (rec.type === "user") {
-      if (isToolResultRecord(rec)) handleToolResults(rec, line.offset, st, config.dependencyLookback);
+      if (hasToolResults(rec)) handleToolResults(rec, st);
       else if (ts(rec)) st.lastEventAt = ts(rec);
-    } else if (rec.type === "attachment" && rec.attachment?.type === "batching_reminder_sent") {
-      counters.reminders++;
     }
   }
 }
@@ -272,15 +257,14 @@ async function readMeta(jsonlPath: string): Promise<SubagentMeta> {
   }
 }
 
-export async function parseSession(path: string, config: Config): Promise<Session> {
-  const files = [path];
-  const main = newStream({ kind: "main" }, 0);
-  const ss: SessionState = { cwd: "", startedAt: 0, endedAt: 0, prompts: [], batchingReminders: 0 };
-  await parseMainFile(path, main, ss, config);
+export async function parseSession(path: string): Promise<Session> {
+  const main = newStream({ kind: "main" });
+  const ss: SessionState = { cwd: "", startedAt: 0, endedAt: 0, prompts: [], sidechains: new Map() };
+  await parseMainFile(path, main, ss);
 
   // Subagents: parse each file, then attach to the Agent tool call that spawned it.
   const runsByToolUse = new Map<string, SubagentRun>();
-  const counters = { reminders: 0 };
+  const unlinked: SubagentRun[] = [];
   for (const f of await subagentFiles(path)) {
     const meta = await readMeta(f);
     const agentId = basename(f, ".jsonl").replace(/^agent-/, "");
@@ -291,9 +275,8 @@ export async function parseSession(path: string, config: Config): Promise<Sessio
       description: meta.description ?? "",
       depth: meta.spawnDepth ?? 1,
     };
-    const st = newStream(agent, files.length);
-    files.push(f);
-    await parseSubagentFile(f, st, config, counters);
+    const st = newStream(agent);
+    await parseSubagentFile(f, st);
     const run: SubagentRun = {
       agentId,
       agentType: agent.agentType,
@@ -301,7 +284,9 @@ export async function parseSession(path: string, config: Config): Promise<Sessio
       depth: agent.depth,
       turns: st.turns,
     };
+    if (!run.turns.length) continue;
     if (meta.toolUseId) runsByToolUse.set(meta.toolUseId, run);
+    else unlinked.push(run);
   }
   const attach = (turns: Turn[]) => {
     for (const t of turns) {
@@ -317,6 +302,27 @@ export async function parseSession(path: string, config: Config): Promise<Sessio
   };
   for (const p of ss.prompts) attach(p.turns);
 
+  // Subagent work that can't be tied to the call that spawned it still counts: file it
+  // under the prompt that was running when it started.
+  const detach = (run: SubagentRun) => {
+    const start = run.turns[0]!.requestedAt;
+    const p = ss.prompts.findLast((q) => q.startedAt <= start) ?? ss.prompts[0] ?? currentPrompt(ss, start);
+    (p.detached ??= []).push(run);
+  };
+  for (const [p, st] of ss.sidechains) {
+    if (st.turns.length) (p.detached ??= []).push({ agentId: "sidechain", agentType: "sidechain", description: SIDECHAIN.description, depth: 1, turns: st.turns });
+  }
+  for (const run of unlinked) {
+    detach(run);
+    attach(run.turns);
+  }
+  // Shallowest first, so a detached parent picks up its own children.
+  for (const [id, run] of [...runsByToolUse].sort((a, b) => a[1].depth - b[1].depth)) {
+    if (!runsByToolUse.delete(id)) continue;
+    detach(run);
+    attach(run.turns);
+  }
+
   return {
     id: basename(path, ".jsonl"),
     projectDir: basename(dirname(path)),
@@ -324,9 +330,7 @@ export async function parseSession(path: string, config: Config): Promise<Sessio
     title: ss.title,
     startedAt: ss.startedAt,
     endedAt: ss.endedAt,
-    files,
     prompts: ss.prompts,
-    batchingReminders: ss.batchingReminders + counters.reminders,
   };
 }
 

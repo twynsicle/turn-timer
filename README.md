@@ -1,31 +1,8 @@
-# turn-timer
+# Claude Session Viewer
 
-Inspect Claude Code session logs to find where sessions go wrong: **which sessions cost the most**, and **where Claude made serial round-trips it didn't need to**.
+An HTML report of your Claude Code sessions: **what they cost, where the time went, which tool calls were slow, and how much cache misses added**.
 
-turn-timer reads the JSONL transcripts in `~/.claude/projects` and breaks each session down by prompt and turn. It estimates each session's cost from the token usage in the logs, ranks sessions across all projects, and flags streaks of single-call turns that could have been one batched turn.
-
-## Terms
-
-| Term | Meaning |
-|---|---|
-| **Prompt** | Your message and everything Claude did in response |
-| **Turn** | One model response, i.e. one API round-trip |
-| **Batch size** | Tool calls in one turn |
-| **Batchable run** | 2+ consecutive single-call turns whose calls didn't depend on each other |
-
-Runs are **likely** batchable when every call is read-only (Read, Grep, Glob, WebFetch, read-only shell commands). They are **possibly** batchable when they include edits to different files. A run breaks when a call mentions a path or pattern that appeared in an earlier result within the run, since that call probably needed the result.
-
-## Cost
-
-Every model response in the logs records its token usage: uncached input, cache writes (5-minute and 1-hour), cache reads and output. turn-timer counts each response once and prices it at Anthropic API list prices ([src/core/cost.ts](src/core/cost.ts)). Cache writes cost 1.25× the input rate (5-minute) or 2× (1-hour). Fast mode costs 2×. Web searches cost $10 per 1,000. Subagent usage counts toward the session that spawned it. Turns on a model with no known price are left out of the total and reported separately.
-
-This is an estimate at API rates, not a bill. On a Pro or Max subscription, it still ranks sessions by how much usage they consumed.
-
-In long sessions, **cache reads usually dominate**: every turn re-reads the whole cached context. That's also why an unnecessary round-trip costs money. A batchable run's "cost saved" is the context re-read (uncached input plus cache reads) of each extra turn. A batched turn would still pay for the output and the new cache writes.
-
-## Batching
-
-"Time saved" is each extra turn's round-trip overhead: its latency minus the time spent generating output (13 ms per output token, calibrated from real sessions). A batched turn would still generate the same thinking and tool inputs, so only the overhead is saved.
+`claude-sessions` reads the JSONL transcripts in `~/.claude/projects` and writes a static report you open in a browser. No server needs to stay running. It takes a few seconds, and parsed sessions are cached, so later runs are faster.
 
 ## Install
 
@@ -37,55 +14,72 @@ npm run build
 npm install -g .
 ```
 
-This works the same on Windows and macOS. For development without installing, use `npm run dev -- <command>`.
+This works the same on Windows and macOS.
 
-## CLI
+## Usage
 
 ```bash
-turn-timer                                # interactive: pick project → session → expand prompts
-turn-timer top                            # most expensive sessions across all projects (last 30 days)
-turn-timer top --since 7d -n 10 -p "alien loot"
-turn-timer projects
-turn-timer sessions "alien loot"          # project by index, folder name or path fragment
-turn-timer show 5ec54f26                  # per-prompt table (session id prefix, title fragment)
-turn-timer show latest -p "alien loot" --turns   # every turn with its tool calls
-turn-timer show 5ec54f26 --prompt 8 -v    # one prompt, with each call's input
-turn-timer show 5ec54f26 --by-tool
-turn-timer stats "alien loot" --since 7d  # summary across a project's sessions
-turn-timer serve                          # web viewer on http://localhost:4317
+claude-sessions                       # last 30 days, all projects; opens the report
+claude-sessions --since 7             # last 7 days (0 = everything still on disk)
+claude-sessions -p "alien loot"       # only projects whose path contains this text
+claude-sessions -o ./report --no-open # write somewhere else, don't open a browser
+claude-sessions --no-cache            # re-parse every log
 ```
 
-Global flags: `--json`, `--no-subagents`, `--no-cache`, `--config <path>`.
+By default the report goes to `report/` in the cache folder (`%LOCALAPPDATA%\claude-session-viewer\cache\report`, `~/Library/Caches/claude-session-viewer/report`). The folder is self-contained: `index.html` plus one `sessions/<id>.js` per session, loaded when you open that session.
 
-## Web viewer
+## The report
 
-`turn-timer serve` opens a local viewer (bound to 127.0.0.1):
+- **Projects:** total cost split by model, time working, turns, cache misses and a cost-per-day chart (stacked by model, local time), then one row per project with the same rollups and the date range its sessions cover. Worktree sessions count toward their project. Sort by cost, time, turns, cache misses or recency.
+- **Project page:** the same summary for one project and one row per session.
+- **Slowest tool calls** and **Tools** (calls, errors, total and average time per tool), on both pages.
+- **Session page:** the same summary for one session, then one row per prompt. Expand a prompt to see its full text and every turn, with its model, tool calls, model time and cost. Subagents are nested under the Agent call that started them. A turn that had to rebuild the cache is marked with a row just before it. Click a tool call to see its input and result preview.
 
-- **Most expensive sessions** (the landing page): every session across all projects, ranked by estimated cost. It shows each session's peak context, cost per turn, cache-read share and what batching would have saved, plus a total cost breakdown by token kind and model.
-- **Project overview:** cost and batching stats across every session, the per-session table (sortable by cost) and the per-tool table.
-- **Session view:** summary tiles, the cost breakdown, the batch-size histogram, and one row per prompt with its cost. Expand a prompt to see its turn timeline:
-  - batch-size badges and tool chips
-  - timing bars (model latency vs tool time)
-  - flagged runs highlighted
-  - subagents nested under the Agent call that spawned them
-- **Batchable runs tab:** every flagged run, sorted by round-trips saved. Click one to jump to it.
-- **Detail drawer:** click any tool call to see its full input and result. These are read from the log on demand.
+## Terms
 
-To develop the viewer, run `npm run dev -- serve --no-open` in one terminal and `npm run dev:web` in another.
+| Term | Meaning |
+|---|---|
+| **Prompt** | Your message and everything Claude did in response |
+| **Turn** | One model response, i.e. one API round-trip |
+| **Model time** | Time waiting on the model (main thread only) |
+| **Tool time** | Time from a tool call to its result (main thread only) |
+| **Time working** | Time from each prompt to its last activity, summed. Idle time between prompts isn't counted |
 
-## Configuration
+## Cost
 
-Classification rules can be tuned in `./turn-timer.config.json` or `~/.turn-timer.json`. Any key replaces the default from [src/core/config.ts](src/core/config.ts):
+Every model response in the logs records its token usage: uncached input, cache writes (5-minute and 1-hour), cache reads and output. Each response is counted once and priced at Anthropic API list prices ([src/core/cost.ts](src/core/cost.ts)):
 
-```json
-{
-  "readOnlyTools": ["Read", "Grep", "Glob", "WebFetch", "WebSearch", "mcp__unity__get_console_logs"],
-  "readOnlyCommands": ["ls", "cat", "git status", "unity status"]
-}
+| Model | Input | Output | Cache read |
+|---|---|---|---|
+| Fable 5.1 | $10 | $50 | $0.25 |
+| Opus 5.5 | $4 | $20 | $0.20 (0.05× input) |
+| Sonnet 5.5 | $2 | $10 | $0.20 (0.1× input) |
+| Opus 5 | $5 | $25 | $0.50 |
+
+Prices are per million tokens; see the file for the full table. Cache writes cost 1.25× the input rate (5-minute) or 2× (1-hour). Fast mode costs 2×. Web searches cost $10 per 1,000. Subagent usage counts toward the session that spawned it. Turns on a model with no known price are left out of the total and flagged.
+
+This is an estimate at API rates, not a bill. It only sees what's in the transcripts. Background calls Claude Code makes outside the conversation (titles, compaction summaries, permission classifiers) don't appear there, so a bill or the Admin usage API can come out higher.
+
+## Cache misses
+
+Each turn re-sends the whole conversation, and normally almost all of it is a cheap cache read. A **cache miss** is a turn where a large part of the context (5,000+ tokens) that the previous turn had cached was written again instead of read. The report classifies each one:
+
+- **Cache expired:** the gap since the previous turn was longer than the cache lifetime. Claude Code writes either a 5-minute or a 1-hour cache, and the lifetime is read from the logs per thread.
+- **Model switch:** the turn used a different model, which has its own cache.
+- **Cache reset:** anything else that changed the start of the context, such as a changed system prompt or tool list.
+
+Compaction isn't counted: it shrinks the context rather than rewriting it. The **extra cost** of a miss is what rewriting the lost tokens cost, minus what reading them from cache would have cost.
+
+## Development
+
+```bash
+npm run dev -- --since 0 --out .dev-report --no-open   # CLI from source (needs `npm run build` once for the page)
+npm run dev:web                                        # page with hot reload, reading .dev-report
+npm test
 ```
 
 ## Notes
 
-- Parsed sessions are cached per session in the OS cache dir (`%LOCALAPPDATA%\turn-timer\cache`, `~/Library/Caches/turn-timer`). A cache entry is invalidated when the log files or the config change. The first parse of a 500 MB session takes about 1.5 s.
-- Claude Code deletes transcripts older than `cleanupPeriodDays` (default 30). Raise it in `~/.claude/settings.json` if you want a longer history.
-- `CLAUDE_CONFIG_DIR` is respected.
+- Claude Code deletes transcripts older than `cleanupPeriodDays` (default 30). Raise it in `~/.claude/settings.json` for a longer history.
+- `CLAUDE_CONFIG_DIR` is respected. `CLAUDE_SESSIONS_CACHE_DIR` overrides the cache folder.
+- Logs can be 500 MB or more. They're streamed, and the tool input and result previews in the report are capped (shorter in very busy sessions) to keep each session's file loadable.
